@@ -39,7 +39,6 @@ var contractNames = []string{
 	"Proxy",
 	"Registry",
 	"Freezer",
-	"TransferWhitelist",
 	"FeeCurrencyWhitelist",
 	"GoldToken",
 	"SortedOracles",
@@ -48,8 +47,10 @@ var contractNames = []string{
 	"Reserve",
 	"StableToken",
 	"StableTokenEUR",
+	"StableTokenBRL",
 	"Exchange",
 	"ExchangeEUR",
+	"ExchangeBRL",
 	"Accounts",
 	"LockedGold",
 	"Validators",
@@ -64,6 +65,10 @@ var contractNames = []string{
 	"DowntimeSlasher",
 	"GovernanceApproverMultiSig",
 	"Governance",
+	"GrandaMento",
+	"FederatedAttestations",
+	"OdisPayments",
+	"FeeHandler",
 }
 
 var buildPath = flag.String("buildpath", "", "the folder where truffle contract build live (on monorepo ./packages/protocol/build/contracts )")

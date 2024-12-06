@@ -41,8 +41,9 @@ var (
 type RoundState interface {
 	// mutation functions
 	StartNewRound(nextRound *big.Int, validatorSet istanbul.ValidatorSet, nextProposer istanbul.Validator) error
-	StartNewSequence(nextSequence *big.Int, validatorSet istanbul.ValidatorSet, nextProposer istanbul.Validator, parentCommits MessageSet) error
-	TransitionToPreprepared(preprepare *istanbul.Preprepare) error
+	StartNewSequence(nextSequence *big.Int, validatorSet istanbul.ValidatorSet,
+		nextProposer istanbul.Validator, parentCommits MessageSet) error
+	TransitionToPrepreparedV2(preprepareV2 *istanbul.PreprepareV2) error
 	TransitionToWaitingForNewRound(r *big.Int, nextProposer istanbul.Validator) error
 	TransitionToCommitted() error
 	TransitionToPrepared(quorumSize int) error
@@ -62,7 +63,7 @@ type RoundState interface {
 	Proposer() istanbul.Validator
 	IsProposer(address common.Address) bool
 	Subject() *istanbul.Subject
-	Preprepare() *istanbul.Preprepare
+	PreprepareV2() *istanbul.PreprepareV2
 	Proposal() istanbul.Proposal
 	Round() *big.Int
 	Commits() MessageSet
@@ -85,10 +86,10 @@ type roundStateImpl struct {
 	sequence     *big.Int
 
 	// data for current round
-	preprepare *istanbul.Preprepare
-	prepares   MessageSet
-	commits    MessageSet
-	proposer   istanbul.Validator
+	preprepareV2 *istanbul.PreprepareV2
+	prepares     MessageSet
+	commits      MessageSet
+	proposer     istanbul.Validator
 
 	// data saves across rounds, same sequence
 	validatorSet        istanbul.ValidatorSet
@@ -198,11 +199,21 @@ func (rs *roundStateImpl) GetPrepareOrCommitSize() int {
 	return result
 }
 
+func (rs *roundStateImpl) lockedPreprepareProposal() *istanbul.Proposal {
+	// Assume locked
+	if rs.preprepareV2 == nil {
+		return nil
+	}
+	return &rs.preprepareV2.Proposal
+}
+
 func (rs *roundStateImpl) Subject() *istanbul.Subject {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 
-	if rs.preprepare == nil {
+	proposal := rs.lockedPreprepareProposal()
+
+	if proposal == nil {
 		return nil
 	}
 
@@ -211,7 +222,7 @@ func (rs *roundStateImpl) Subject() *istanbul.Subject {
 			Round:    new(big.Int).Set(rs.round),
 			Sequence: new(big.Int).Set(rs.sequence),
 		},
-		Digest: rs.preprepare.Proposal.Hash(),
+		Digest: (*proposal).Hash(),
 	}
 }
 
@@ -244,22 +255,22 @@ func (rs *roundStateImpl) GetValidatorByAddress(address common.Address) istanbul
 	return validator
 }
 
-func (rs *roundStateImpl) Preprepare() *istanbul.Preprepare {
+func (rs *roundStateImpl) PreprepareV2() *istanbul.PreprepareV2 {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 
-	return rs.preprepare
+	return rs.preprepareV2
 }
 
 func (rs *roundStateImpl) Proposal() istanbul.Proposal {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
 
-	if rs.preprepare != nil {
-		return rs.preprepare.Proposal
+	proposal := rs.lockedPreprepareProposal()
+	if proposal == nil {
+		return nil
 	}
-
-	return nil
+	return *proposal
 }
 
 func (rs *roundStateImpl) Round() *big.Int {
@@ -288,7 +299,7 @@ func (rs *roundStateImpl) changeRound(nextRound *big.Int, validatorSet istanbul.
 	rs.proposer = nextProposer
 
 	// ??
-	rs.preprepare = nil
+	rs.preprepareV2 = nil
 }
 
 func (rs *roundStateImpl) StartNewRound(nextRound *big.Int, validatorSet istanbul.ValidatorSet, nextProposer istanbul.Validator) error {
@@ -300,7 +311,8 @@ func (rs *roundStateImpl) StartNewRound(nextRound *big.Int, validatorSet istanbu
 	return nil
 }
 
-func (rs *roundStateImpl) StartNewSequence(nextSequence *big.Int, validatorSet istanbul.ValidatorSet, nextProposer istanbul.Validator, parentCommits MessageSet) error {
+func (rs *roundStateImpl) StartNewSequence(nextSequence *big.Int, validatorSet istanbul.ValidatorSet,
+	nextProposer istanbul.Validator, parentCommits MessageSet) error {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	logger := rs.newLogger()
@@ -331,11 +343,11 @@ func (rs *roundStateImpl) TransitionToCommitted() error {
 	return nil
 }
 
-func (rs *roundStateImpl) TransitionToPreprepared(preprepare *istanbul.Preprepare) error {
+func (rs *roundStateImpl) TransitionToPrepreparedV2(preprepareV2 *istanbul.PreprepareV2) error {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 
-	rs.preprepare = preprepare
+	rs.preprepareV2 = preprepareV2
 	rs.state = StatePreprepared
 	return nil
 }
@@ -388,7 +400,7 @@ func (rs *roundStateImpl) TransitionToPrepared(quorumSize int) error {
 		return errFailedCreatePreparedCertificate
 	}
 	rs.preparedCertificate = istanbul.PreparedCertificate{
-		Proposal:                rs.preprepare.Proposal,
+		Proposal:                *rs.lockedPreprepareProposal(),
 		PrepareOrCommitMessages: messages,
 	}
 
@@ -397,18 +409,30 @@ func (rs *roundStateImpl) TransitionToPrepared(quorumSize int) error {
 }
 
 func (rs *roundStateImpl) AddCommit(msg *istanbul.Message) error {
+	// IMPORTANT: due to how in the roundstate_save_decorator
+	// & roundstate_db we are breaking encapsulation of this type,
+	// this method CANNOT and SHOULD NOT modify ANYTHING OTHER than
+	// the 'commits' message set.
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	return rs.commits.Add(msg)
 }
 
 func (rs *roundStateImpl) AddPrepare(msg *istanbul.Message) error {
+	// IMPORTANT: due to how in the roundstate_save_decorator
+	// & roundstate_db we are breaking encapsulation of this type,
+	// this method CANNOT and SHOULD NOT modify ANYTHING OTHER than
+	// the 'prepares' message set.
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	return rs.prepares.Add(msg)
 }
 
 func (rs *roundStateImpl) AddParentCommit(msg *istanbul.Message) error {
+	// IMPORTANT: due to how in the roundstate_save_decorator
+	// & roundstate_db we are breaking encapsulation of this type,
+	// this method CANNOT and SHOULD NOT modify ANYTHING OTHER than
+	// the 'parentCommits' message set.
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	return rs.parentCommits.Add(msg)
@@ -524,8 +548,8 @@ func (rs *roundStateImpl) Summary() *RoundStateSummary {
 		summary.PendingRequestHash = &hash
 	}
 
-	if rs.preprepare != nil {
-		summary.Preprepare = rs.preprepare.Summary()
+	if rs.preprepareV2 != nil {
+		summary.Preprepare = rs.preprepareV2.Summary()
 	}
 
 	if !rs.preparedCertificate.IsEmpty() {
@@ -606,10 +630,10 @@ func (rs *roundStateImpl) EncodeRLP(w io.Writer) error {
 	}
 
 	var serializedPreprepare []byte
-	if rs.preprepare == nil {
+	if rs.preprepareV2 == nil {
 		serializedPreprepare = rlp.EmptyList
 	} else {
-		serializedPreprepare, err = rlp.EncodeToBytes(rs.preprepare)
+		serializedPreprepare, err = rlp.EncodeToBytes(rs.preprepareV2)
 		if err != nil {
 			return err
 		}
@@ -686,12 +710,12 @@ func (rs *roundStateImpl) DecodeRLP(stream *rlp.Stream) error {
 	}
 
 	if !bytes.Equal(data.SerializedPreprepare, rlp.EmptyList) {
-		var value istanbul.Preprepare
+		var value istanbul.PreprepareV2
 		err := rlp.DecodeBytes(data.SerializedPreprepare, &value)
 		if err != nil {
 			return err
 		}
-		rs.preprepare = &value
+		rs.preprepareV2 = &value
 	}
 
 	return nil

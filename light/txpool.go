@@ -69,20 +69,25 @@ type TxPool struct {
 	mined        map[common.Hash][]*types.Transaction // mined transactions by block hash
 	clearIdx     uint64                               // earliest block nr that can contain mined tx info
 
-	istanbul bool // Fork indicator whether we are in the istanbul stage
-	donut    bool // Fork indicator whether Donut has been activated
-	espresso bool // Fork indicator whether Espresso has been activated
+	homestead     bool // Fork indicator whether homestead has been activated
+	istanbul      bool // Fork indicator whether we are in the istanbul stage
+	donut         bool // Fork indicator whether Donut has been activated
+	espresso      bool // Fork indicator whether Espresso has been activated
+	gingerbread   bool // Fork indicator whether Gingerbread has been activated
+	gingerbreadP2 bool // Fork indicator whether Gingerbread has been activated
+	hfork         bool // Fork indicator whether HFork has been activated
 }
 
-// TxRelayBackend provides an interface to the mechanism that forwards transacions
-// to the ETH network. The implementations of the functions should be non-blocking.
+// TxRelayBackend provides an interface to the mechanism that forwards transactions to the
+// ETH network. The implementations of the functions should be non-blocking.
 //
-// Send instructs backend to forward new transactions
-// NewHead notifies backend about a new head after processed by the tx pool,
-//  including  mined and rolled back transactions since the last event
-// Discard notifies backend about transactions that should be discarded either
-//  because they have been replaced by a re-send or because they have been mined
-//  long ago and no rollback is expected
+// Send instructs backend to forward new transactions NewHead notifies backend about a new
+// head after processed by the tx pool, including mined and rolled back transactions since
+// the last event.
+//
+// Discard notifies backend about transactions that should be discarded either because
+// they have been replaced by a re-send or because they have been mined long ago and no
+// rollback is expected.
 type TxRelayBackend interface {
 	Send(txs types.Transactions)
 	NewHead(head common.Hash, mined []common.Hash, rollback []common.Hash)
@@ -327,6 +332,9 @@ func (pool *TxPool) setNewHead(head *types.Header) {
 	pool.istanbul = pool.config.IsIstanbul(next)
 	pool.donut = pool.config.IsDonut(next)
 	pool.espresso = pool.config.IsEspresso(next)
+	pool.gingerbread = pool.config.IsGingerbread(next)
+	pool.gingerbreadP2 = pool.config.IsGingerbreadP2(next)
+	pool.hfork = pool.config.IsHFork(next)
 }
 
 // Stop stops the light transaction pool
@@ -372,6 +380,28 @@ func (pool *TxPool) validateTx(ctx context.Context, tx *types.Transaction) error
 		return err
 	}
 
+	// CIP 57 deprecates full node incentives
+	if pool.gingerbread && tx.GatewaySet() {
+		return core.ErrGatewayFeeDeprecated
+	}
+
+	// Accept only legacy transactions until EIP-2718/2930 activates.
+	if !pool.espresso && tx.Type() != types.LegacyTxType {
+		return core.ErrTxTypeNotSupported
+	}
+	// Reject dynamic fee transactions until EIP-1559 activates.
+	if !pool.espresso && (tx.Type() == types.DynamicFeeTxType || tx.Type() == types.CeloDynamicFeeTxType) {
+		return core.ErrTxTypeNotSupported
+	}
+	// Reject celo dynamic fee v2 until gingerbreadP2
+	if !pool.gingerbreadP2 && tx.Type() == types.CeloDynamicFeeTxV2Type {
+		return core.ErrTxTypeNotSupported
+	}
+	// Reject celo denominated fee until h fork
+	if !pool.hfork && tx.Type() == types.CeloDenominatedTxType {
+		return core.ErrTxTypeNotSupported
+	}
+
 	// Validate the transaction sender and it's sig. Throw
 	// if the from fields is invalid.
 	if from, err = types.Sender(pool.signer, tx); err != nil {
@@ -381,6 +411,18 @@ func (pool *TxPool) validateTx(ctx context.Context, tx *types.Transaction) error
 	currentState := pool.currentState(ctx)
 	if n := currentState.GetNonce(from); n > tx.Nonce() {
 		return core.ErrNonceTooLow
+	}
+
+	// Sanity check for extremely large numbers
+	if tx.GasFeeCap().BitLen() > 256 {
+		return core.ErrFeeCapVeryHigh
+	}
+	if tx.GasTipCap().BitLen() > 256 {
+		return core.ErrTipVeryHigh
+	}
+	// Ensure gasFeeCap is greater than or equal to gasTipCap.
+	if tx.GasFeeCapIntCmp(tx.GasTipCap()) < 0 {
+		return core.ErrTipAboveFeeCap
 	}
 
 	// Transactions can't be negative. This may never happen

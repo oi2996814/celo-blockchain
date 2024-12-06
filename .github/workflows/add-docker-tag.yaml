@@ -1,0 +1,47 @@
+name: Add Tags to Blockchain Release Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      source-image:
+        description: Container source image (registry/image:tag)
+        required: true
+        type: string
+      destination-image:
+        description: Container destination image (registry/image:tag)
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      source-image:
+        description: Container source image (registry/image:tag)
+        required: true
+        type: string
+      destination-image:
+        description: Container destination image (registry/image:tag)
+        required: true
+        type: string
+
+jobs:
+  add-tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    steps:
+      - name: Login at GCP Artifact Registry
+        uses: celo-org/reusable-workflows/.github/actions/auth-gcp-artifact-registry@v2.0.5
+        with:
+          workload-id-provider: 'projects/1094498259535/locations/global/workloadIdentityPools/gh-celo-blockchain-dev/providers/github-by-repos'
+          service-account: 'celo-blockchain-dev@devopsre.iam.gserviceaccount.com'
+          docker-gcp-registries: us-west1-docker.pkg.dev
+
+      - name: Install regctl
+        run: |
+          curl -L https://github.com/regclient/regclient/releases/latest/download/regctl-linux-amd64 > regctl
+          chmod 755 regctl
+          sudo mv regctl /usr/local/sbin
+
+      - name: Use regctl to copy images (add tags)
+        run: |
+          regctl image copy ${{ inputs.source-image }} ${{ inputs.destination-image }}

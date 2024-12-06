@@ -113,9 +113,10 @@ func (v *View) String() string {
 }
 
 // Cmp compares v and y and returns:
-//   -1 if v <  y
-//    0 if v == y
-//   +1 if v >  y
+//
+//	-1 if v <  y
+//	 0 if v == y
+//	+1 if v >  y
 func (v *View) Cmp(y *View) int {
 	if v.Sequence.Cmp(y.Sequence) != 0 {
 		return v.Sequence.Cmp(y.Sequence)
@@ -126,84 +127,10 @@ func (v *View) Cmp(y *View) int {
 	return 0
 }
 
-// ## RoundChangeCertificate ##############################################################
-
-type RoundChangeCertificate struct {
-	RoundChangeMessages []Message
-}
-
-func (b *RoundChangeCertificate) IsEmpty() bool {
-	return len(b.RoundChangeMessages) == 0
-}
-
-// ## Preprepare ##############################################################
-
-// NewPreprepareMessage constructs a Message instance with the given sender and
-// prePrepare. Both the prePrepare instance and the serialized bytes of
-// prePrepare are part of the returned Message.
-func NewPreprepareMessage(prePrepare *Preprepare, sender common.Address) *Message {
-	message := &Message{
-		Address:    sender,
-		Code:       MsgPreprepare,
-		prePrepare: prePrepare,
-	}
-	setMessageBytes(message, prePrepare)
-	return message
-}
-
-type Preprepare struct {
-	View                   *View
-	Proposal               Proposal
-	RoundChangeCertificate RoundChangeCertificate
-}
-
-type PreprepareData struct {
-	View                   *View
-	Proposal               *types.Block
-	RoundChangeCertificate RoundChangeCertificate
-}
-
 type PreprepareSummary struct {
 	View                          *View            `json:"view"`
 	ProposalHash                  common.Hash      `json:"proposalHash"`
 	RoundChangeCertificateSenders []common.Address `json:"roundChangeCertificateSenders"`
-}
-
-func (pp *Preprepare) HasRoundChangeCertificate() bool {
-	return !pp.RoundChangeCertificate.IsEmpty()
-}
-
-func (pp *Preprepare) AsData() *PreprepareData {
-	return &PreprepareData{
-		View:                   pp.View,
-		Proposal:               pp.Proposal.(*types.Block),
-		RoundChangeCertificate: pp.RoundChangeCertificate,
-	}
-}
-
-func (pp *Preprepare) Summary() *PreprepareSummary {
-	return &PreprepareSummary{
-		View:                          pp.View,
-		ProposalHash:                  pp.Proposal.Hash(),
-		RoundChangeCertificateSenders: MapMessagesToSenders(pp.RoundChangeCertificate.RoundChangeMessages),
-	}
-}
-
-// RLP Encoding ---------------------------------------------------------------
-
-// EncodeRLP serializes b into the Ethereum RLP format.
-func (pp *Preprepare) EncodeRLP(w io.Writer) error {
-	return rlp.Encode(w, pp.AsData())
-}
-
-// DecodeRLP implements rlp.Decoder, and load the consensus fields from a RLP stream.
-func (pp *Preprepare) DecodeRLP(s *rlp.Stream) error {
-	var data PreprepareData
-	if err := s.Decode(&data); err != nil {
-		return err
-	}
-	pp.View, pp.Proposal, pp.RoundChangeCertificate = data.View, data.Proposal, data.RoundChangeCertificate
-	return nil
 }
 
 // ## PreparedCertificate #####################################################
@@ -238,6 +165,11 @@ func EmptyPreparedCertificate() PreparedCertificate {
 		Proposal:                block.WithHeader(emptyHeader),
 		PrepareOrCommitMessages: []Message{},
 	}
+}
+
+func EmptyPreparedCertificateV2() (PreparedCertificateV2, Proposal) {
+	pc := EmptyPreparedCertificate()
+	return PCV2FromPCV1(pc), pc.Proposal
 }
 
 func (pc *PreparedCertificate) IsEmpty() bool {
@@ -284,49 +216,6 @@ func (pc *PreparedCertificate) DecodeRLP(s *rlp.Stream) error {
 	pc.PrepareOrCommitMessages, pc.Proposal = data.PrepareOrCommitMessages, data.Proposal
 	return nil
 
-}
-
-// ## RoundChange #############################################################
-
-// NewRoundChangeMessage constructs a Message instance with the given sender and
-// roundChange. Both the roundChange instance and the serialized bytes of
-// roundChange are part of the returned Message.
-func NewRoundChangeMessage(roundChange *RoundChange, sender common.Address) *Message {
-	message := &Message{
-		Address:     sender,
-		Code:        MsgRoundChange,
-		roundChange: roundChange,
-	}
-	setMessageBytes(message, roundChange)
-	return message
-}
-
-type RoundChange struct {
-	View                *View
-	PreparedCertificate PreparedCertificate
-}
-
-func (b *RoundChange) HasPreparedCertificate() bool {
-	return !b.PreparedCertificate.IsEmpty()
-}
-
-// EncodeRLP serializes b into the Ethereum RLP format.
-func (b *RoundChange) EncodeRLP(w io.Writer) error {
-	return rlp.Encode(w, []interface{}{b.View, &b.PreparedCertificate})
-}
-
-// DecodeRLP implements rlp.Decoder, and load the consensus fields from a RLP stream.
-func (b *RoundChange) DecodeRLP(s *rlp.Stream) error {
-	var roundChange struct {
-		View                *View
-		PreparedCertificate PreparedCertificate
-	}
-
-	if err := s.Decode(&roundChange); err != nil {
-		return err
-	}
-	b.View, b.PreparedCertificate = roundChange.View, roundChange.PreparedCertificate
-	return nil
 }
 
 // ## Subject #################################################################
@@ -493,11 +382,23 @@ func (qed *QueryEnodeData) DecodeRLP(s *rlp.Stream) error {
 // ## Consensus Message codes ##########################################################
 
 const (
-	MsgPreprepare uint64 = iota
+	DEPRECATED_MsgPreprepare uint64 = iota // Moved to V2
 	MsgPrepare
 	MsgCommit
-	MsgRoundChange
+	DEPRECATED_MsgRoundChange // Moved to V2
+	MsgRoundChangeV2
+	MsgPreprepareV2
 )
+
+// IsRoundChangeCode returns true if and only if the message code equals MsgRoundChangeV2
+func IsRoundChangeCode(istanbulMsgCode uint64) bool {
+	return istanbulMsgCode == MsgRoundChangeV2
+}
+
+// IsPreprepareCode returns true if and only if the message code equals MsgPreprepareV2
+func IsPreprepareCode(istanbulMsgCode uint64) bool {
+	return istanbulMsgCode == MsgPreprepareV2
+}
 
 // Message is a wrapper used for all istanbul communication. It encapsulates
 // the sender's address, a code that indicates the type of the wrapped message
@@ -521,9 +422,9 @@ type Message struct {
 	// serializable since they are private. They are set when calling
 	// Message.FromPayload, or at message construction time.
 	committedSubject    *CommittedSubject
-	prePrepare          *Preprepare
+	prePrepareV2        *PreprepareV2
 	prepare             *Subject
-	roundChange         *RoundChange
+	roundChangeV2       *RoundChangeV2
 	queryEnode          *QueryEnodeData
 	forwardMessage      *ForwardMessage
 	enodeCertificate    *EnodeCertificate
@@ -537,7 +438,7 @@ type Message struct {
 func setMessageBytes(msg *Message, innerMessage interface{}) {
 	bytes, err := rlp.EncodeToBytes(innerMessage)
 	if err != nil {
-		panic(fmt.Sprintf("attempt to serialise inner message of type %T failed", innerMessage))
+		panic(fmt.Sprintf("attempt to serialise inner message of type %T failed. %s", innerMessage, err))
 	}
 	msg.Msg = bytes
 }
@@ -552,28 +453,16 @@ func (m *Message) Sign(signingFn func(data []byte) ([]byte, error)) error {
 	return err
 }
 
-func (m *Message) DecodeRLP(stream *rlp.Stream) error {
-	type decodable Message
-	var d decodable
-	err := stream.Decode(&d)
-	if err != nil {
-		return err
-	}
-	*m = Message(d)
-
-	if len(m.Msg) == 0 && len(m.Signature) == 0 {
-		// Empty validator handshake message
-		return nil
-	}
-
+func (m *Message) DecodeMessage() error {
+	var err error
 	switch m.Code {
-	case MsgPreprepare:
-		var p *Preprepare
+	case MsgPreprepareV2:
+		var p *PreprepareV2
 		err = m.decode(&p)
 		if err != nil {
 			return err
 		}
-		m.prePrepare = p
+		m.prePrepareV2 = p
 	case MsgPrepare:
 		var p *Subject
 		err = m.decode(&p)
@@ -582,13 +471,13 @@ func (m *Message) DecodeRLP(stream *rlp.Stream) error {
 		var cs *CommittedSubject
 		err = m.decode(&cs)
 		m.committedSubject = cs
-	case MsgRoundChange:
-		var p *RoundChange
+	case MsgRoundChangeV2:
+		var p *RoundChangeV2
 		err = m.decode(&p)
 		if err != nil {
 			return err
 		}
-		m.roundChange = p
+		m.roundChangeV2 = p
 	case QueryEnodeMsg:
 		var q *QueryEnodeData
 		err = m.decode(&q)
@@ -613,13 +502,29 @@ func (m *Message) DecodeRLP(stream *rlp.Stream) error {
 		err = fmt.Errorf("unrecognised message code %d", m.Code)
 	}
 	return err
+}
 
+func (m *Message) DecodeRLP(stream *rlp.Stream) error {
+	type decodable Message
+	var d decodable
+	err := stream.Decode(&d)
+	if err != nil {
+		return err
+	}
+	*m = Message(d)
+
+	if len(m.Msg) == 0 && len(m.Signature) == 0 {
+		// Empty validator handshake message
+		return nil
+	}
+
+	return m.DecodeMessage()
 }
 
 // FromPayload decodes b into a Message instance it will set one of the private
 // fields committedSubject, prePrepare, prepare or roundChange depending on the
 // type of the message.
-func (m *Message) FromPayload(b []byte, validateFn func([]byte, []byte) (common.Address, error)) error {
+func (m *Message) FromPayload(b []byte, validateFn ValidateFn) error {
 	// Decode Message
 	err := rlp.DecodeBytes(b, &m)
 	if err != nil {
@@ -628,18 +533,8 @@ func (m *Message) FromPayload(b []byte, validateFn func([]byte, []byte) (common.
 
 	// Validate message (on a message without Signature)
 	if validateFn != nil {
-		var payload []byte
-		payload, err = m.PayloadNoSig()
-		if err != nil {
+		if err := CheckSignedBy(m, m.Signature, m.Address, ErrInvalidSigner, validateFn); err != nil {
 			return err
-		}
-
-		signed_val_addr, err := validateFn(payload, m.Signature)
-		if err != nil {
-			return err
-		}
-		if signed_val_addr != m.Address {
-			return ErrInvalidSigner
 		}
 	}
 	return nil
@@ -671,9 +566,9 @@ func (m *Message) Commit() *CommittedSubject {
 	return m.committedSubject
 }
 
-// Preprepare returns preprepare if this is a preprepare message.
-func (m *Message) Preprepare() *Preprepare {
-	return m.prePrepare
+// PreprepareV2 returns preprepare if this is a preprepare message.
+func (m *Message) PreprepareV2() *PreprepareV2 {
+	return m.prePrepareV2
 }
 
 // Prepare returns prepare if this is a prepare message.
@@ -681,9 +576,9 @@ func (m *Message) Prepare() *Subject {
 	return m.prepare
 }
 
-// Prepare returns round change if this is a round change message.
-func (m *Message) RoundChange() *RoundChange {
-	return m.roundChange
+// RoundChangeV2 returns a round change v2 if this is a round change v2 message.
+func (m *Message) RoundChangeV2() *RoundChangeV2 {
+	return m.roundChangeV2
 }
 
 // QueryEnode returns query enode data if this is a query enode message.

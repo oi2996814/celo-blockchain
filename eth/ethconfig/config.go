@@ -53,10 +53,11 @@ var Defaults = Config{
 	SnapshotCache:           102,
 	GatewayFee:              big.NewInt(0),
 
-	TxPool:              core.DefaultTxPoolConfig,
-	RPCGasInflationRate: 1.3,
-	RPCGasCap:           25000000,
-	RPCTxFeeCap:         500, // 500 celo
+	TxPool:                core.DefaultTxPoolConfig,
+	RPCGasInflationRate:   1.3,
+	RPCGasPriceMultiplier: big.NewInt(200),
+	RPCGasCap:             25000000,
+	RPCTxFeeCap:           500, // 500 celo
 
 	Istanbul: *istanbul.DefaultConfig,
 }
@@ -139,6 +140,10 @@ type Config struct {
 	// RPCGasInflationRate is a global multiplier applied to the gas estimations
 	RPCGasInflationRate float64
 
+	// RPCGasPriceMultiplier is a global multiplier applied to the gas price
+	// It's a percent value, e.g. 120 means a multiplication factor of 1.2
+	RPCGasPriceMultiplier *big.Int
+
 	// RPCGasCap is the global gas cap for eth-call variants.
 	RPCGasCap uint64
 
@@ -146,14 +151,22 @@ type Config struct {
 	// send-transction variants. The unit is ether.
 	RPCTxFeeCap float64
 
+	// RPCEthCompatibility is used to determine whether the 'gaslimit' end
+	// 'baseFeePerGas' fields should be added to blocks returned by the RPC
+	// API. Where true indicates the fields should be added.
+	RPCEthCompatibility bool
+
 	// Checkpoint is a hardcoded checkpoint which can be nil.
 	Checkpoint *params.TrustedCheckpoint `toml:",omitempty"`
 
 	// CheckpointOracle is the configuration for checkpoint oracle.
 	CheckpointOracle *params.CheckpointOracleConfig `toml:",omitempty"`
 
-	// E block override (TODO: remove after the fork)
-	OverrideEHardfork *big.Int `toml:",omitempty"`
+	// HFork block override (TODO: remove after the fork)
+	OverrideHFork *big.Int `toml:",omitempty"`
+
+	// l2 migration block, last block of l1 before l2 migration
+	L2MigrationBlock *big.Int `toml:",omitempty"`
 
 	// The minimum required peers in order for syncing to be initiated, if left
 	// at 0 then the default will be used.
@@ -171,7 +184,6 @@ func CreateConsensusEngine(stack *node.Node, chainConfig *params.ChainConfig, co
 		if err := istanbul.ApplyParamsChainConfigToConfig(chainConfig, &config.Istanbul); err != nil {
 			log.Crit("Invalid Configuration for Istanbul Engine", "err", err)
 		}
-
 		return istanbulBackend.New(&config.Istanbul, db)
 	}
 	log.Error(fmt.Sprintf("Only Istanbul Consensus is supported: %v", chainConfig))

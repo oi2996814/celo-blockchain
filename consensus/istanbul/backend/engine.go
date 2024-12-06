@@ -31,6 +31,7 @@ import (
 	"github.com/celo-org/celo-blockchain/consensus/istanbul/validator"
 	"github.com/celo-org/celo-blockchain/contracts/blockchain_parameters"
 	gpm "github.com/celo-org/celo-blockchain/contracts/gasprice_minimum"
+	"github.com/celo-org/celo-blockchain/contracts/gold_token"
 	"github.com/celo-org/celo-blockchain/core"
 	ethCore "github.com/celo-org/celo-blockchain/core"
 	"github.com/celo-org/celo-blockchain/core/state"
@@ -124,6 +125,10 @@ func (sb *Backend) verifyHeader(chain consensus.ChainHeaderReader, header *types
 	if header.Number == nil {
 		return errUnknownBlock
 	}
+	if chain.Config().IsL2Migration(header.Number) {
+		sb.logger.Trace("Reject block after L2 migration", "num", header.Number)
+		return fmt.Errorf("Block number %d is after the L2 migration.", header.Number)
+	}
 
 	// If the full chain isn't available (as on mobile devices), don't reject future blocks
 	// This is due to potential clock skew
@@ -138,7 +143,7 @@ func (sb *Backend) verifyHeader(chain consensus.ChainHeaderReader, header *types
 	}
 
 	// Ensure that the extra data format is satisfied
-	if _, err := types.ExtractIstanbulExtra(header); err != nil {
+	if _, err := header.IstanbulExtra(); err != nil {
 		return errInvalidExtraDataFormat
 	}
 
@@ -196,6 +201,50 @@ func (sb *Backend) verifyCascadingFields(chain consensus.ChainHeaderReader, head
 		// Verify validators in extraData. Validators in snapshot and extraData should be the same.
 		if err := sb.verifySigner(chain, header, parents); err != nil {
 			return err
+		}
+
+		if chain.Config().IsGingerbread(header.Number) {
+			// Verify that the gasUsed is <= gasLimit
+			if header.GasUsed > header.GasLimit {
+				return fmt.Errorf("invalid gasUsed: have %d, gasLimit %d", header.GasUsed, header.GasLimit)
+			}
+			// Verify BaseFee is not nil.
+			if header.BaseFee == nil {
+				return fmt.Errorf("invalid BaseFee: must be different than <nil>")
+			}
+			// Verify Difficulty is not nil.
+			if header.Difficulty == nil {
+				return fmt.Errorf("invalid Difficulty: must be different than <nil>")
+			}
+			// Verify Difficulty is zero.
+			if header.Difficulty.Cmp(big.NewInt(0)) != 0 {
+				return fmt.Errorf("invalid Difficulty: have %d, want 0", header.Difficulty.Uint64())
+			}
+			// Verify Nonce is zero.
+			if header.Nonce.Uint64() != types.EncodeNonce(0).Uint64() {
+				return fmt.Errorf("invalid Nonce: have %d, want 0", header.Nonce.Uint64())
+			}
+			// Verify UncleHash is the empty hash.
+			if header.UncleHash != types.EmptyUncleHash {
+				return fmt.Errorf("invalid UncleHash: have %v, want %v", header.UncleHash, types.EmptyUncleHash)
+			}
+			// Verify MixDigest is the empty hash.
+			if header.MixDigest != types.EmptyMixDigest {
+				return fmt.Errorf("invalid MixDigest: have %v, want %v", header.MixDigest, types.EmptyMixDigest)
+			}
+		} else {
+			// Verify BaseFee not present before Gingerbread fork.
+			if header.BaseFee != nil {
+				return fmt.Errorf("invalid baseFee before fork: have %s, want <nil>", header.BaseFee)
+			}
+			// Verify GasLimit not bigger than zero before Gingerbread fork.
+			if header.GasLimit > 0 {
+				return fmt.Errorf("invalid gasLimit before fork: have %d, want <nil>", header.GasLimit)
+			}
+			// Verify Difficulty not present before Gingerbread fork.
+			if header.Difficulty != nil {
+				return fmt.Errorf("invalid Difficulty before fork: have %d, want <nil>", header.Difficulty)
+			}
 		}
 	} else if err := sb.checkEpochBlockExists(chain, header, parents); err != nil {
 		return err
@@ -273,7 +322,7 @@ func (sb *Backend) verifyAggregatedSeals(chain consensus.ChainHeaderReader, head
 		return nil
 	}
 
-	extra, err := types.ExtractIstanbulExtra(header)
+	extra, err := header.IstanbulExtra()
 	if err != nil {
 		return err
 	}
@@ -373,7 +422,7 @@ func (sb *Backend) VerifySeal(header *types.Header) error {
 		return errUnknownBlock
 	}
 
-	extra, err := types.ExtractIstanbulExtra(header)
+	extra, err := header.IstanbulExtra()
 	if err != nil {
 		return errInvalidExtraDataFormat
 	}
@@ -501,16 +550,18 @@ func (sb *Backend) Finalize(chain consensus.ChainHeaderReader, header *types.Hea
 
 	snapshot := state.Snapshot()
 	vmRunner := sb.chain.NewEVMRunner(header, state)
-	err := sb.setInitialGoldTokenTotalSupplyIfUnset(vmRunner)
+	err := gold_token.SetInitialTotalSupplyIfUnset(sb.db, vmRunner)
 	if err != nil {
 		state.RevertToSnapshot(snapshot)
 	}
 
-	// Trigger an update to the gas price minimum in the GasPriceMinimum contract based on block congestion
-	snapshot = state.Snapshot()
-	_, err = gpm.UpdateGasPriceMinimum(vmRunner, header.GasUsed)
-	if err != nil {
-		state.RevertToSnapshot(snapshot)
+	if !sb.ChainConfig().IsGingerbread(header.Number) {
+		// Trigger an update to the gas price minimum in the GasPriceMinimum contract based on block congestion
+		snapshot = state.Snapshot()
+		_, err = gpm.UpdateGasPriceMinimum(vmRunner, header.GasUsed)
+		if err != nil {
+			state.RevertToSnapshot(snapshot)
+		}
 	}
 
 	lastBlockOfEpoch := istanbul.IsLastBlockOfEpoch(header.Number.Uint64(), sb.config.Epoch)
@@ -559,7 +610,7 @@ func (sb *Backend) checkIsValidSigner(chain consensus.ChainHeaderReader, header 
 }
 
 // Seal generates a new block for the given input block with the local miner's
-// seal place on top and submits it the the consensus engine.
+// seal place on top and submits it the consensus engine.
 func (sb *Backend) Seal(chain consensus.ChainHeaderReader, block *types.Block) error {
 
 	header := block.Header()
@@ -861,7 +912,7 @@ func (sb *Backend) snapshot(chain consensus.ChainHeaderReader, number uint64, ha
 			return nil, errors.New("Cannot load genesis")
 		}
 
-		istanbulExtra, err := types.ExtractIstanbulExtra(genesis)
+		istanbulExtra, err := genesis.IstanbulExtra()
 		if err != nil {
 			log.Error("Unable to extract istanbul extra", "err", err)
 			return nil, err
@@ -948,7 +999,7 @@ func (sb *Backend) addParentSeal(chain consensus.ChainHeaderReader, header *type
 
 	// Get parent's extra to fetch it's AggregatedSeal
 	parent := chain.GetHeader(header.ParentHash, number-1)
-	parentExtra, err := types.ExtractIstanbulExtra(parent)
+	parentExtra, err := parent.IstanbulExtra()
 	if err != nil {
 		return err
 	}
@@ -1046,7 +1097,7 @@ func ecrecover(header *types.Header) (common.Address, error) {
 	}
 
 	// Retrieve the signature from the header extra-data
-	istanbulExtra, err := types.ExtractIstanbulExtra(header)
+	istanbulExtra, err := header.IstanbulExtra()
 	if err != nil {
 		return common.Address{}, err
 	}
@@ -1099,7 +1150,7 @@ func writeValidatorSetDiff(header *types.Header, oldValSet []istanbul.ValidatorD
 			"addedValidators", common.ConvertToStringSlice(addedValidatorsAddresses), "removedValidators", removedValidators.Text(16))
 	}
 
-	extra, err := types.ExtractIstanbulExtra(header)
+	extra, err := header.IstanbulExtra()
 	if err != nil {
 		return nil
 	}
@@ -1124,7 +1175,7 @@ func writeSeal(h *types.Header, seal []byte) error {
 		return errInvalidSignature
 	}
 
-	istanbulExtra, err := types.ExtractIstanbulExtra(h)
+	istanbulExtra, err := h.IstanbulExtra()
 	if err != nil {
 		return err
 	}
@@ -1147,7 +1198,7 @@ func writeAggregatedSeal(h *types.Header, aggregatedSeal types.IstanbulAggregate
 		return errInvalidAggregatedSeal
 	}
 
-	istanbulExtra, err := types.ExtractIstanbulExtra(h)
+	istanbulExtra, err := h.IstanbulExtra()
 	if err != nil {
 		return err
 	}

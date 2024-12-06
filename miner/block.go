@@ -25,6 +25,7 @@ import (
 
 	"github.com/celo-org/celo-blockchain/common"
 	"github.com/celo-org/celo-blockchain/consensus"
+	"github.com/celo-org/celo-blockchain/consensus/misc"
 	"github.com/celo-org/celo-blockchain/contracts/blockchain_parameters"
 	"github.com/celo-org/celo-blockchain/contracts/currency"
 	"github.com/celo-org/celo-blockchain/contracts/random"
@@ -40,11 +41,13 @@ import (
 type blockState struct {
 	signer types.Signer
 
-	state    *state.StateDB // apply state changes here
-	tcount   int            // tx count in cycle
-	gasPool  *core.GasPool  // available gas used to pack transactions
-	gasLimit uint64
-	sysCtx   *core.SysContractCallCtx
+	state        *state.StateDB    // apply state changes here
+	tcount       int               // tx count in cycle
+	gasPool      *core.GasPool     // available gas used to pack transactions
+	bytesBlock   *core.BytesBlock  // available bytes used to pack transactions
+	multiGasPool core.MultiGasPool // available gas to pay for with currency
+	gasLimit     uint64
+	sysCtx       *core.SysContractCallCtx
 
 	header         *types.Header
 	txs            []*types.Transaction
@@ -108,9 +111,30 @@ func prepareBlock(w *worker) (*blockState, error) {
 		gasLimit:       blockchain_parameters.GetBlockGasLimitOrDefault(vmRunner),
 		header:         header,
 		txFeeRecipient: txFeeRecipient,
-		sysCtx:         core.NewSysContractCallCtx(w.chain.NewEVMRunner(header, state.Copy())),
 	}
 	b.gasPool = new(core.GasPool).AddGas(b.gasLimit)
+
+	if w.chainConfig.IsGingerbread(header.Number) {
+		header.GasLimit = b.gasLimit
+		header.Difficulty = big.NewInt(0)
+		header.Nonce = types.EncodeNonce(0)
+		header.UncleHash = types.EmptyUncleHash
+		header.MixDigest = types.EmptyMixDigest
+		// Needs the baseFee at the final state of the last block
+		parentVmRunner := w.chain.NewEVMRunner(parent.Header(), state.Copy())
+		header.BaseFee = misc.CalcBaseFee(w.chainConfig, parent.Header(), parentVmRunner)
+	}
+	if w.chainConfig.IsGingerbreadP2(header.Number) {
+		b.bytesBlock = new(core.BytesBlock).SetLimit(params.MaxTxDataPerBlock)
+	}
+	b.sysCtx = core.NewSysContractCallCtx(header, state.Copy(), w.chain)
+
+	b.multiGasPool = core.NewMultiGasPool(
+		b.gasLimit,
+		b.sysCtx.GetWhitelistedCurrencies(),
+		w.config.FeeCurrencyDefault,
+		w.config.FeeCurrencyLimits,
+	)
 
 	// Play our part in generating the random beacon.
 	if w.isRunning() && random.IsRunning(vmRunner) {
@@ -235,12 +259,29 @@ loop:
 		if tx == nil {
 			break
 		}
+		// Short-circuit if the transaction is using more gas allocated for the
+		// given fee currency.
+		if b.multiGasPool.PoolFor(tx.FeeCurrency()).Gas() < tx.Gas() {
+			log.Trace(
+				"Skipping transaction which requires more gas than is left in the pool for a specific fee currency",
+				"currency", tx.FeeCurrency(), "tx hash", tx.Hash(),
+				"gas", b.multiGasPool.PoolFor(tx.FeeCurrency()).Gas(), "txgas", tx.Gas(),
+			)
+			txs.Pop()
+			continue
+		}
 		// Short-circuit if the transaction requires more gas than we have in the pool.
 		// If we didn't short-circuit here, we would get core.ErrGasLimitReached below.
 		// Short-circuiting here saves us the trouble of checking the GPM and so on when the tx can't be included
 		// anyway due to the block not having enough gas left.
 		if b.gasPool.Gas() < tx.Gas() {
 			log.Trace("Skipping transaction which requires more gas than is left in the block", "hash", tx.Hash(), "gas", b.gasPool.Gas(), "txgas", tx.Gas())
+			txs.Pop()
+			continue
+		}
+		// Same short-circuit of the gas above, but for bytes in the block (b.bytesBlock != nil => GingerbreadP2)
+		if b.bytesBlock != nil && b.bytesBlock.BytesLeft() < uint64(tx.Size()) {
+			log.Trace("Skipping transaction which requires more bytes than is left in the block", "hash", tx.Hash(), "bytes", b.bytesBlock.BytesLeft(), "txbytes", uint64(tx.Size()))
 			txs.Pop()
 			continue
 		}
@@ -257,10 +298,19 @@ loop:
 			txs.Pop()
 			continue
 		}
+		if tx.GatewaySet() && w.chainConfig.IsGingerbread(b.header.Number) {
+			log.Trace("Ignoring transaction with gateway fee", "hash", tx.Hash(), "gingerbread", w.chainConfig.GingerbreadBlock)
+
+			txs.Pop()
+			continue
+		}
 		// Start executing the transaction
 		b.state.Prepare(tx.Hash(), b.tcount)
 
+		availableGas := b.gasPool.Gas()
 		logs, err := b.commitTransaction(w, tx, txFeeRecipient)
+		gasUsed := availableGas - b.gasPool.Gas()
+
 		switch {
 		case errors.Is(err, core.ErrGasLimitReached):
 			// Pop the current out-of-gas transaction without shifting in the next from the account
@@ -287,6 +337,25 @@ loop:
 			// Everything ok, collect the logs and shift in the next transaction from the same account
 			coalescedLogs = append(coalescedLogs, logs...)
 			b.tcount++
+			// bytesBlock != nil => GingerbreadP2
+			if b.bytesBlock != nil && w.chainConfig.IsGingerbreadP2(b.header.Number) {
+				if err := b.bytesBlock.SubBytes(uint64(tx.Size())); err != nil {
+					// This should never happen because we are validating before that we have enough space
+					return err
+				}
+			}
+
+			err = b.multiGasPool.PoolFor(tx.FeeCurrency()).SubGas(gasUsed)
+			// Should never happen as we check it above
+			if err != nil {
+				log.Warn(
+					"Unexpectedly reached limit for fee currency",
+					"hash", tx.Hash(), "gas", b.multiGasPool.PoolFor(tx.FeeCurrency()).Gas(),
+					"tx gas used", gasUsed,
+				)
+				return err
+			}
+
 			txs.Shift()
 
 		default:
@@ -353,14 +422,18 @@ func (b *blockState) finalizeAndAssemble(w *worker) (*types.Block, error) {
 }
 
 // totalFees computes total consumed fees in CELO. Block transactions and receipts have to have the same order.
-func totalFees(block *types.Block, receipts []*types.Receipt, baseFeeFn func(*common.Address) *big.Int, toCELO func(*big.Int, *common.Address) *big.Int, espresso bool) *big.Float {
+func totalFees(block *types.Block, receipts []*types.Receipt, baseFeeFn func(*common.Address) *big.Int, toCELO types.ToCELOFn, espresso bool) *big.Float {
 	feesWei := new(big.Int)
 	for i, tx := range block.Transactions() {
 		var basefee *big.Int
 		if espresso {
 			basefee = baseFeeFn(tx.FeeCurrency())
 		}
-		fee := toCELO(new(big.Int).Mul(new(big.Int).SetUint64(receipts[i].GasUsed), tx.EffectiveGasTipValue(basefee)), tx.FeeCurrency())
+		fee, err := toCELO(new(big.Int).Mul(new(big.Int).SetUint64(receipts[i].GasUsed), tx.EffectiveGasTipValue(basefee)), tx.FeeCurrency())
+		if err != nil {
+			log.Error("totalFees: Could not convert fees for tx", "tx", tx, "err", err)
+			continue
+		}
 		feesWei.Add(feesWei, fee)
 	}
 	return new(big.Float).Quo(new(big.Float).SetInt(feesWei), new(big.Float).SetInt(big.NewInt(params.Ether)))
@@ -368,16 +441,19 @@ func totalFees(block *types.Block, receipts []*types.Receipt, baseFeeFn func(*co
 
 // createConversionFunctions creates a function to convert any currency to Celo and a function to get the gas price minimum for that currency.
 // Both functions internally cache their results.
-func createConversionFunctions(sysCtx *core.SysContractCallCtx, chain *core.BlockChain, header *types.Header, state *state.StateDB) (func(feeCurrency *common.Address) *big.Int, func(amount *big.Int, feeCurrency *common.Address) *big.Int) {
+func createConversionFunctions(sysCtx *core.SysContractCallCtx, chain *core.BlockChain, header *types.Header, state *state.StateDB) (func(feeCurrency *common.Address) *big.Int, types.ToCELOFn) {
 	vmRunner := chain.NewEVMRunner(header, state)
 	currencyManager := currency.NewManager(vmRunner)
 
 	baseFeeFn := func(feeCurrency *common.Address) *big.Int {
 		return sysCtx.GetGasPriceMinimum(feeCurrency)
 	}
-	toCeloFn := func(amount *big.Int, feeCurrency *common.Address) *big.Int {
-		curr, _ := currencyManager.GetCurrency(feeCurrency)
-		return curr.ToCELO(amount)
+	toCeloFn := func(amount *big.Int, feeCurrency *common.Address) (*big.Int, error) {
+		curr, err := currencyManager.GetCurrency(feeCurrency)
+		if err != nil {
+			return nil, fmt.Errorf("toCeloFn: %w", err)
+		}
+		return curr.ToCELO(amount), nil
 	}
 
 	return baseFeeFn, toCeloFn

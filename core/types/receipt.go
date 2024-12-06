@@ -176,7 +176,7 @@ func (r *Receipt) DecodeRLP(s *rlp.Stream) error {
 			return errEmptyTypedReceipt
 		}
 		r.Type = b[0]
-		if r.Type == AccessListTxType || r.Type == DynamicFeeTxType || r.Type == CeloDynamicFeeTxType {
+		if r.Type == AccessListTxType || r.Type == DynamicFeeTxType || r.Type == CeloDynamicFeeTxType || r.Type == CeloDynamicFeeTxV2Type || r.Type == CeloDenominatedTxType {
 			var dec receiptRLP
 			if err := rlp.DecodeBytes(b[1:], &dec); err != nil {
 				return err
@@ -349,6 +349,12 @@ func (rs Receipts) EncodeIndex(i int, w *bytes.Buffer) {
 	case CeloDynamicFeeTxType:
 		w.WriteByte(CeloDynamicFeeTxType)
 		rlp.Encode(w, data)
+	case CeloDynamicFeeTxV2Type:
+		w.WriteByte(CeloDynamicFeeTxV2Type)
+		rlp.Encode(w, data)
+	case CeloDenominatedTxType:
+		w.WriteByte(CeloDenominatedTxType)
+		rlp.Encode(w, data)
 	default:
 		// For unsupported types, write nothing. Since this is for
 		// DeriveSha, the error will be caught matching the derived hash
@@ -362,9 +368,11 @@ func (r Receipts) DeriveFields(config *params.ChainConfig, hash common.Hash, num
 	signer := MakeSigner(config, new(big.Int).SetUint64(number))
 
 	logIndex := uint(0)
-	// The receipts may include an additional "block finalization" receipt (only IBFT)
-	if !(len(txs) == len(r) || len(txs)+1 == len(r)) {
-		return errors.New("transaction and receipt count mismatch")
+	if len(txs) != len(r) {
+		// The receipts may include an additional "block finalization" receipt (only IBFT)
+		if len(txs)+1 != len(r) || !isBlockReceipt(r[len(r)-1]) {
+			return errors.New("transaction and receipt count mismatch")
+		}
 	}
 
 	// len(r) is not always strictly equal to len(txs) because of the block finalization receipt (IBFT)
@@ -401,7 +409,7 @@ func (r Receipts) DeriveFields(config *params.ChainConfig, hash common.Hash, num
 		}
 	}
 
-	// Handle block finalization receipt (only IBFT)
+	// Handle block finalization receipt (only IBFT) which is always the last receipt
 	if len(txs)+1 == len(r) {
 		j := len(txs)
 		for k := 0; k < len(r[j].Logs); k++ {
@@ -415,4 +423,8 @@ func (r Receipts) DeriveFields(config *params.ChainConfig, hash common.Hash, num
 	}
 
 	return nil
+}
+
+func isBlockReceipt(receipt *Receipt) bool {
+	return len(receipt.Logs) > 0 && receipt.Logs[0].TxHash == receipt.Logs[0].BlockHash
 }

@@ -137,6 +137,11 @@ func handleGetBlockBodies67(backend Backend, msg Decoder, peer *Peer) error {
 	return peer.ReplyBlockBodiesRLP(query.RequestId, response)
 }
 
+// In Celo the return value of the `GetBlockBodies` query has been changed to include both the block hash
+// and the block bodies. This is necessary because received block bodies can not be matched to the header
+// directly, as there is body data (i.e. `Randomness` and `EpochSnarkData`) which is not represented in the
+// header. That means that that the block fetcher cannot find the corresponding header for given blockdata
+// without executing the block contents. This is avoided by passing the block hash with the body data.
 func answerGetBlockBodiesQuery(backend Backend, query GetBlockBodiesPacket, peer *Peer) ([]rlp.RawValue, error) {
 	// Gather blocks until the fetch or network limits is reached
 	var (
@@ -148,14 +153,15 @@ func answerGetBlockBodiesQuery(backend Backend, query GetBlockBodiesPacket, peer
 			lookups >= 2*maxBodiesServe {
 			break
 		}
-		// Retrieve the requested block body, stopping if enough was found
-		if body := backend.Chain().GetBody(hash); body != nil {
-			bh := &blockBodyWithBlockHash{BlockHash: hash, BlockBody: body}
-			bhRLPbytes, err := rlp.EncodeToBytes(bh)
+		// Retrieve the requested block body RLP, stopping if enough was found
+		if body := backend.Chain().GetBodyRLP(hash); len(body) != 0 {
+			hashRLP, err := rlp.EncodeToBytes(hash)
+
 			if err != nil {
 				return nil, err
 			}
-			bhRLP := rlp.RawValue(bhRLPbytes)
+			bhRLP := rlp.Combine(hashRLP, body)
+
 			bodiesAndBlockHashes = append(bodiesAndBlockHashes, bhRLP)
 			bytes += len(bhRLP)
 		}

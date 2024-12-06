@@ -27,28 +27,6 @@ const BlockchainParametersStr = `[
 	{
 		"constant": true,
 		"inputs": [],
-		"name": "getMinimumClientVersion",
-		"outputs": [
-			{
-			"name": "major",
-			"type": "uint256"
-			},
-			{
-			"name": "minor",
-			"type": "uint256"
-			},
-			{
-			"name": "patch",
-			"type": "uint256"
-			}
-		],
-		"payable": false,
-		"stateMutability": "view",
-		"type": "function"
-	},
-	{
-		"constant": true,
-		"inputs": [],
 		"name": "blockGasLimit",
 		"outputs": [
 			{
@@ -141,7 +119,7 @@ const ERC20Str = `[
 }]`
 
 // This is taken from celo-monorepo/packages/protocol/build/<env>/contracts/FeeCurrency.json
-const FeeCurrencyStr = `[
+const FeeCurrencyWhitelistStr = `[
 	{
 		"constant": true,
 		"inputs": [],
@@ -449,7 +427,31 @@ const GasPriceMinimumStr = `[
 		"payable": false,
 		"stateMutability": "nonpayable",
 		"type": "function"
-		}
+	},
+	{
+		"inputs": [
+			{
+				"internalType": "uint256",
+				"name": "blockGasTotal",
+				"type": "uint256"
+			},
+			{
+				"internalType": "uint256",
+				"name": "blockGasLimit",
+				"type": "uint256"
+			}
+		],
+		"name": "getUpdatedGasPriceMinimum",
+		"outputs": [
+			{
+				"internalType": "uint256",
+				"name": "",
+				"type": "uint256"
+			}
+		],
+		"stateMutability": "view",
+		"type": "function"
+	}
 ]`
 
 // nolint: gosec
@@ -747,4 +749,44 @@ const ValidatorsStr = `[
 		"stateMutability": "view",
 		"type": "function"
 	}
+]`
+
+const FeeCurrencyStr = `[
+	{
+		"constant": true,
+		"inputs": [
+			{
+				"name": "who",
+				"type": "address"
+			}
+		],
+		"name": "balanceOf",
+		"outputs": [
+			{
+				"name": "",
+				"type": "uint256"
+			}
+		],
+		"payable": false,
+		"stateMutability": "view",
+		"type": "function"
+	},
+	{
+		"inputs": [
+		{
+			"internalType": "address",
+			"name": "from",
+			"type": "address"
+		},
+		{
+			"internalType": "uint256",
+			"name": "value",
+			"type": "uint256"
+		}
+		],
+		"name": "debitGasFees",
+		"outputs": [],
+		"stateMutability": "nonpayable",
+		"type": "function"
+  }
 ]`

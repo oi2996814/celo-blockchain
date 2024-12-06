@@ -1,0 +1,775 @@
+name: celo-blockchain CI/CD
+run-name: celo-blockchain CI/CD for ${{ github.head_ref || github.ref_name }}
+
+on:
+  push:
+    branches:
+      - master
+
+  pull_request:
+    branches:
+      - master
+
+concurrency:
+  group: blockchain-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  # Increment these to force cache rebuilding
+  SYSTEM_CONTRACTS_CACHE_VERSION: 4
+  CHECKOUT_MONOREPO_CACHE_VERSION: 8
+  GO_VERSION: '1.19'
+  # Location where compiled system contracts are stored under the root of this
+  # repo.
+  SYSTEM_CONTRACTS_PATH: "compiled-system-contracts"
+  # Used for celo-monorepo
+  NODE_VERSION: 18.18
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare-system-contracts:
+    name: Build celo-monorepo
+    ## Uncommend if you want to run in org-runners or github's runners.
+    ## Remind to also replace in other jobs
+    # runs-on: ['self-hosted', 'org', '8-cpu']
+    # container:
+    #   # Update image at https://github.com/celo-org/infrastructure/blob/master/terraform/root-modules/gcp/integration-tests-gke/files/github-arc/Dockerfiles/Dockerfile-blockchain
+    #   image: us-west1-docker.pkg.dev/devopsre/actions-runner-controller/blockchain:latest
+    #   options: --user root
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    env:
+      CONTRACTS_BUILD_PATH: packages/protocol/build
+
+    steps:
+    - name: Checkout celo-blockchain repo
+      uses: actions/checkout@v4
+      with:
+        path: geth
+    # Workaround to error https://github.com/golangci/golangci-lint/issues/4033
+    - name: Configure git safe directories
+      run: git config --global --add safe.directory '*'
+    - name: Get monorepo commit
+      run: echo "MONOREPO_COMMIT=$(cat ./geth/monorepo_commit)" >> $GITHUB_ENV
+    - name: Get monorepo commit id
+      run: echo "MONOREPO_COMMIT_ID=${{ hashFiles('./geth/monorepo_commit') }}" >> $GITHUB_ENV
+    - name: Restore celo-monorepo cache
+      id: celo-monorepo-cache
+      uses: actions/cache@v4
+      with:
+        path: celo-monorepo
+        key: celo-monorepo-cache-${{ env.MONOREPO_COMMIT_ID }}-${{ env.CHECKOUT_MONOREPO_CACHE_VERSION }}
+        restore-keys: |
+          celo-monorepo-cache-
+    # If there is a cached version, there is no need to rebuild it
+    - name: Conditionally checkout monorepo
+      if: steps.celo-monorepo-cache.outputs.cache-hit != 'true'
+      uses: actions/checkout@v4
+      with:
+        repository: celo-org/celo-monorepo
+        path: celo-monorepo
+        ref: ${{ env.MONOREPO_COMMIT }}
+    - name: Conditionally setup Node.js
+      if: steps.celo-monorepo-cache.outputs.cache-hit != 'true'
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: yarn
+        cache-dependency-path: celo-monorepo/yarn.lock
+    - name: Conditionally build monorepo
+      if: steps.celo-monorepo-cache.outputs.cache-hit != 'true'
+      run: |
+        cd celo-monorepo
+        yarn
+        yarn build
+        cd packages/protocol
+        yarn run build:sol
+    - name: Upload built system contracts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: system-contracts
+        path: 'celo-monorepo/${{ env.CONTRACTS_BUILD_PATH }}'
+
+  go-modules:
+    name: Setup go
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+    - name: Setup go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+
+  check-imports:
+    name: Check imports
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    needs: 
+    - go-modules
+    
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+    - name: Check imports to ensure we are using github.com/celo-org/celo-blockchain
+      run: ./scripts/check_imports.sh
+
+  lint:
+    name: Lint code
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    needs: 
+    - go-modules
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+    # Workaround to error https://github.com/golangci/golangci-lint/issues/4033
+    - name: Configure git safe directories
+      run: git config --global --add safe.directory '*'
+    - name: Run linter
+      run: make lint
+
+  unit-tests:
+    name: Unit tests
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    needs:
+    - go-modules
+    - prepare-system-contracts
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+    - name: Restore system contracts
+      uses: actions/download-artifact@v4
+      with:
+        name: system-contracts
+        path: ${{ env.SYSTEM_CONTRACTS_PATH }}
+    - name: Prepare ethersjs project
+      run: make prepare-ethersjs-project
+    - name: Setup tmate session
+      uses: mxschmitt/action-tmate@v3
+      timeout-minutes: 20
+      if: false
+      with:
+        limit-access-to-actor: true
+    - name: Run tests
+      run: |
+        go install github.com/jstemmer/go-junit-report@latest
+        CI=true HOME=~ go test -v -cover -coverprofile=coverage.out ./... | tee go-test.out
+    - name: Generate test report
+      if: always()
+      run: |
+        $(go env GOPATH)/bin/go-junit-report -set-exit-code < go-test.out | tee -a report.xml
+    - name: Test summary
+      id: unit-tests-summary
+      if: always()
+      uses: test-summary/action@v2
+      with:
+        paths: |
+          report.xml
+        output: test-summary.md
+        show: "fail"
+    - name: Post test summary comment on PR
+      if: always()
+      uses: mshick/add-pr-comment@v2
+      with:
+        message-path: test-summary.md
+        message-id: test-summary
+    # TODO: figure out if we need a token
+    - name: Upload coverage to codecov
+      if: always()
+      uses: codecov/codecov-action@v4
+    - name: Fail if there are failed tests
+      if: steps.unit-tests-summary.outputs.failed > 0
+      run: |
+        echo "There are failed tests"
+        exit 1
+
+  race:
+    name: Data race detector
+    if: ${{ github.ref == 'refs/heads/master' || contains(github.ref, 'release') }}
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    needs:
+    - go-modules
+    - prepare-system-contracts
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+    - name: Restore system contracts
+      uses: actions/download-artifact@v4
+      with:
+        name: system-contracts
+        path: ${{ env.SYSTEM_CONTRACTS_PATH }}
+    - name: Prepare ethersjs project
+      run: make prepare-ethersjs-project
+    - name: Install JUnit report
+      run: go get github.com/jstemmer/go-junit-report
+    - name: Run tests
+      run: |
+        set -o pipefail
+        mkdir -p /tmp/test-results
+        trap "go-junit-report < /tmp/test-results/go-test.out > /tmp/test-results/go-test-report.xml" EXIT
+        go test -p 1 -v -race ./... | tee /tmp/test-results/go-test.out
+    - name: Upload test report
+      uses: actions/upload-artifact@v4
+      with:
+        name: data-race-detector-report
+        path: /tmp/test-results
+
+  build-and-store-binaries:
+    name: Build and store binaries
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    needs:
+    - go-modules
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+    # Workaround to error https://github.com/golangci/golangci-lint/issues/4033
+    - name: Configure git safe directories
+      run: git config --global --add safe.directory '*'
+    - name: Run and compress executables
+      run: |
+        make all
+    - name: Upload binaries
+      uses: actions/upload-artifact@v4
+      with:
+        name: binaries
+        path: ./build/bin
+
+  istanbul-e2e-coverage:
+    name: Istanbul consensus coverage
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    # Needed to publish the summary PR comment
+    permissions:
+      pull-requests: write
+
+    needs:
+    - go-modules
+    - prepare-system-contracts
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+    - name: Prepare ethersjs project
+      run: make prepare-ethersjs-project
+    - name: Restore system contracts
+      uses: actions/download-artifact@v4
+      with:
+        name: system-contracts
+        path: ${{ env.SYSTEM_CONTRACTS_PATH }}
+    - name: Run tests and print coverage summary
+      run: |
+        go test -v -coverprofile cov.out -coverpkg ./consensus/istanbul/... ./e2e_test
+        go run tools/parsecov/main.go -packagePrefix github.com/celo-org/celo-blockchain/ cov.out > summary
+        cat summary
+    - name: Build summary message
+      run: |
+        EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+        echo "PR_SUMMARY_MESSAGE<<$EOF" >> $GITHUB_ENV
+        echo "Coverage from tests in \`./e2e_test/...\` for \`./consensus/istanbul/...\` at commit $GITHUB_SHA" >> $GITHUB_ENV
+        echo "<details><summary>" >> $GITHUB_ENV
+        head -n 1 summary >> $GITHUB_ENV
+        echo "</summary><br><pre>" >> $GITHUB_ENV
+        tail -n +2 summary >> $GITHUB_ENV
+        echo "</pre>" >> $GITHUB_ENV
+        echo "$EOF" >> $GITHUB_ENV
+    - name: Post summary comment on PR
+      uses: mshick/add-pr-comment@v2
+      with:
+        message: "${{ env.PR_SUMMARY_MESSAGE }}"
+        message-id: istanbul-cov-summary
+
+  lightest-sync-test:
+    name: Lightest sync test
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+
+    needs:
+    - go-modules
+    - build-and-store-binaries
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+    - name: Download pre-built binaries
+      uses: actions/download-artifact@v4
+      with:
+        name: binaries
+        path: ./build/bin
+    - name: Fix permissions
+      run: |
+        chmod +x ./build/bin/*
+    - name: Run sync test
+      run: |
+        DATADIR=/tmp/lightest_sync_test_data MODE=lightest ./scripts/sync_test.sh
+
+  e2e-benchmarks:
+    name: End-to-end benchmarks
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    timeout-minutes: 30
+
+    needs:
+    - go-modules
+    - prepare-system-contracts
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+    # Workaround to error https://github.com/golangci/golangci-lint/issues/4033
+    - name: Configure git safe directories
+      run: git config --global --add safe.directory '*'
+    - name: Restore system contracts
+      uses: actions/download-artifact@v4
+      with:
+        name: system-contracts
+        path: ${{ env.SYSTEM_CONTRACTS_PATH }}
+    - name: Run benchmarks
+      run: |
+        set -o pipefail
+        mkdir -p /tmp/bench-results
+        trap "grep -E 'goos: |^goarch: |^pkg: |^cpu: |^Benchmark' /tmp/bench-results/go-bench.out > /tmp/bench-results/go-bench-results.txt" EXIT
+        go test ./e2e_test -run Bench -bench . | tee /tmp/bench-results/go-bench.out
+    - name: Upload results
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-benchmarks
+        path: /tmp/bench-results
+
+  end-to-end-blockchain-parameters-test:
+    name: End-to-end blockchain parameters test
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    timeout-minutes: 30
+
+    needs:
+    - go-modules
+    - prepare-system-contracts
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        path: geth
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+        cache-dependency-path: geth/go.sum
+    # Workaround to error https://github.com/golangci/golangci-lint/issues/4033
+    - name: Configure git safe directories
+      run: git config --global --add safe.directory '*'
+    - name: Get monorepo commit
+      run: echo "MONOREPO_COMMIT=$(cat ./geth/monorepo_commit)" >> $GITHUB_ENV
+    - name: Get monorepo commit id
+      run: echo "MONOREPO_COMMIT_ID=${{ hashFiles('./geth/monorepo_commit') }}" >> $GITHUB_ENV
+    - name: Restore celo-monorepo cache
+      id: celo-monorepo-cache
+      uses: actions/cache@v4
+      with:
+        path: celo-monorepo
+        key: celo-monorepo-cache-${{ env.MONOREPO_COMMIT_ID }}-${{ env.CHECKOUT_MONOREPO_CACHE_VERSION }}
+        restore-keys: |
+          celo-monorepo-cache-
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: yarn
+        cache-dependency-path: celo-monorepo/yarn.lock
+
+    - name: Run e2e test
+      run: |
+        export E2E_TESTS_FORCE_USE_MYCELO=true
+        cd celo-monorepo/packages/celotool
+        ./ci_test_blockchain_parameters.sh local "$GITHUB_WORKSPACE/geth"
+
+  end-to-end-governance-test:
+    name: End-to-end governance test
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    timeout-minutes: 30
+
+    needs:
+    - go-modules
+    - prepare-system-contracts
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        path: geth
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+        cache-dependency-path: geth/go.sum
+    # Workaround to error https://github.com/golangci/golangci-lint/issues/4033
+    - name: Configure git safe directories
+      run: git config --global --add safe.directory '*'
+    - name: Get monorepo commit
+      run: echo "MONOREPO_COMMIT=$(cat ./geth/monorepo_commit)" >> $GITHUB_ENV
+    - name: Get monorepo commit id
+      run: echo "MONOREPO_COMMIT_ID=${{ hashFiles('./geth/monorepo_commit') }}" >> $GITHUB_ENV
+    - name: Restore celo-monorepo cache
+      id: celo-monorepo-cache
+      uses: actions/cache@v4
+      with:
+        path: celo-monorepo
+        key: celo-monorepo-cache-${{ env.MONOREPO_COMMIT_ID }}-${{ env.CHECKOUT_MONOREPO_CACHE_VERSION }}
+        restore-keys: |
+          celo-monorepo-cache-
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: yarn
+        cache-dependency-path: celo-monorepo/yarn.lock
+    - name: Run e2e test
+      run: |
+        export E2E_TESTS_FORCE_USE_MYCELO=true
+        cd celo-monorepo/packages/celotool
+        ./ci_test_governance.sh local "$GITHUB_WORKSPACE/geth"
+
+
+  end-to-end-sync-test:
+    name: End-to-end sync test
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    timeout-minutes: 30
+
+    needs:
+    - go-modules
+    - prepare-system-contracts
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        path: geth
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+        cache-dependency-path: geth/go.sum
+    # Workaround to error https://github.com/golangci/golangci-lint/issues/4033
+    - name: Configure git safe directories
+      run: git config --global --add safe.directory '*'
+    - name: Get monorepo commit
+      run: echo "MONOREPO_COMMIT=$(cat ./geth/monorepo_commit)" >> $GITHUB_ENV
+    - name: Get monorepo commit id
+      run: echo "MONOREPO_COMMIT_ID=${{ hashFiles('./geth/monorepo_commit') }}" >> $GITHUB_ENV
+    - name: Restore celo-monorepo cache
+      id: celo-monorepo-cache
+      uses: actions/cache@v4
+      with:
+        path: celo-monorepo
+        key: celo-monorepo-cache-${{ env.MONOREPO_COMMIT_ID }}-${{ env.CHECKOUT_MONOREPO_CACHE_VERSION }}
+        restore-keys: |
+          celo-monorepo-cache-
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: yarn
+        cache-dependency-path: celo-monorepo/yarn.lock
+    - name: Run e2e test
+      run: |
+        export E2E_TESTS_FORCE_USE_MYCELO=true
+        cd celo-monorepo/packages/celotool
+        ./ci_test_sync.sh local "$GITHUB_WORKSPACE/geth"
+
+  end-to-end-slashing-test:
+    name: End-to-end slashing test
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    timeout-minutes: 30
+
+    needs:
+    - go-modules
+    - prepare-system-contracts
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        path: geth
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+        cache-dependency-path: geth/go.sum
+    # Workaround to error https://github.com/golangci/golangci-lint/issues/4033
+    - name: Configure git safe directories
+      run: git config --global --add safe.directory '*'
+    - name: Get monorepo commit
+      run: echo "MONOREPO_COMMIT=$(cat ./geth/monorepo_commit)" >> $GITHUB_ENV
+    - name: Get monorepo commit id
+      run: echo "MONOREPO_COMMIT_ID=${{ hashFiles('./geth/monorepo_commit') }}" >> $GITHUB_ENV
+    - name: Restore celo-monorepo cache
+      id: celo-monorepo-cache
+      uses: actions/cache@v4
+      with:
+        path: celo-monorepo
+        key: celo-monorepo-cache-${{ env.MONOREPO_COMMIT_ID }}-${{ env.CHECKOUT_MONOREPO_CACHE_VERSION }}
+        restore-keys: |
+          celo-monorepo-cache-
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: yarn
+        cache-dependency-path: celo-monorepo/yarn.lock
+    - name: Run e2e test
+      run: |
+        export E2E_TESTS_FORCE_USE_MYCELO=true
+        cd celo-monorepo/packages/celotool
+        ./ci_test_slashing.sh local "$GITHUB_WORKSPACE/geth"
+
+  end-to-end-transfers-test:
+    name: End-to-end transfers test
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    timeout-minutes: 30
+
+    needs:
+    - go-modules
+    - prepare-system-contracts
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        path: geth
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+        cache-dependency-path: geth/go.sum
+    # Workaround to error https://github.com/golangci/golangci-lint/issues/4033
+    - name: Configure git safe directories
+      run: git config --global --add safe.directory '*'
+    - name: Get monorepo commit
+      run: echo "MONOREPO_COMMIT=$(cat ./geth/monorepo_commit)" >> $GITHUB_ENV
+    - name: Get monorepo commit id
+      run: echo "MONOREPO_COMMIT_ID=${{ hashFiles('./geth/monorepo_commit') }}" >> $GITHUB_ENV
+    - name: Restore celo-monorepo cache
+      id: celo-monorepo-cache
+      uses: actions/cache@v4
+      with:
+        path: celo-monorepo
+        key: celo-monorepo-cache-${{ env.MONOREPO_COMMIT_ID }}-${{ env.CHECKOUT_MONOREPO_CACHE_VERSION }}
+        restore-keys: |
+          celo-monorepo-cache-
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: yarn
+        cache-dependency-path: celo-monorepo/yarn.lock
+    - name: Run e2e test
+      run: |
+        export E2E_TESTS_FORCE_USE_MYCELO=true
+        cd celo-monorepo/packages/celotool
+        ./ci_test_transfers.sh local "$GITHUB_WORKSPACE/geth"
+
+  end-to-end-validator-order-test:
+    name: End-to-end validator order test
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    timeout-minutes: 30
+
+    needs:
+    - go-modules
+    - prepare-system-contracts
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        path: geth
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+        cache-dependency-path: geth/go.sum
+    # Workaround to error https://github.com/golangci/golangci-lint/issues/4033
+    - name: Configure git safe directories
+      run: git config --global --add safe.directory '*'
+    - name: Get monorepo commit
+      run: echo "MONOREPO_COMMIT=$(cat ./geth/monorepo_commit)" >> $GITHUB_ENV
+    - name: Get monorepo commit id
+      run: echo "MONOREPO_COMMIT_ID=${{ hashFiles('./geth/monorepo_commit') }}" >> $GITHUB_ENV
+    - name: Restore celo-monorepo cache
+      id: celo-monorepo-cache
+      uses: actions/cache@v4
+      with:
+        path: celo-monorepo
+        key: celo-monorepo-cache-${{ env.MONOREPO_COMMIT_ID }}-${{ env.CHECKOUT_MONOREPO_CACHE_VERSION }}
+        restore-keys: |
+          celo-monorepo-cache-
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: yarn
+        cache-dependency-path: celo-monorepo/yarn.lock
+    - name: Run e2e test
+      run: |
+        export E2E_TESTS_FORCE_USE_MYCELO=true
+        cd celo-monorepo/packages/celotool
+        ./ci_test_validator_order.sh local "$GITHUB_WORKSPACE/geth"
+
+  end-to-end-cip35-eth-compatibility-test:
+    name: End-to-end CIP35-eth compatibility test
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    timeout-minutes: 30
+
+    needs:
+    - go-modules
+    - prepare-system-contracts
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        path: geth
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+        cache-dependency-path: geth/go.sum
+    # Workaround to error https://github.com/golangci/golangci-lint/issues/4033
+    - name: Configure git safe directories
+      run: git config --global --add safe.directory '*'
+    - name: Get monorepo commit
+      run: echo "MONOREPO_COMMIT=$(cat ./geth/monorepo_commit)" >> $GITHUB_ENV
+    - name: Get monorepo commit id
+      run: echo "MONOREPO_COMMIT_ID=${{ hashFiles('./geth/monorepo_commit') }}" >> $GITHUB_ENV
+    - name: Restore celo-monorepo cache
+      id: celo-monorepo-cache
+      uses: actions/cache@v4
+      with:
+        path: celo-monorepo
+        key: celo-monorepo-cache-${{ env.MONOREPO_COMMIT_ID }}-${{ env.CHECKOUT_MONOREPO_CACHE_VERSION }}
+        restore-keys: |
+          celo-monorepo-cache-
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: yarn
+        cache-dependency-path: celo-monorepo/yarn.lock
+    - name: Run e2e test
+      run: |
+        export E2E_TESTS_FORCE_USE_MYCELO=true
+        cd celo-monorepo/packages/celotool
+        ./ci_test_cip35.sh local "$GITHUB_WORKSPACE/geth"
+
+  end-to-end-replica-test:
+    name: End-to-end replica test
+    runs-on: ["8-cpu","self-hosted","blockchain"]
+    timeout-minutes: 30
+
+    needs:
+    - go-modules
+    - prepare-system-contracts
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        path: geth
+    - name: Setup golang
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        check-latest: false
+        cache: true
+        cache-dependency-path: geth/go.sum
+    # Workaround to error https://github.com/golangci/golangci-lint/issues/4033
+    - name: Configure git safe directories
+      run: git config --global --add safe.directory '*'
+    - name: Get monorepo commit
+      run: echo "MONOREPO_COMMIT=$(cat ./geth/monorepo_commit)" >> $GITHUB_ENV
+    - name: Get monorepo commit id
+      run: echo "MONOREPO_COMMIT_ID=${{ hashFiles('./geth/monorepo_commit') }}" >> $GITHUB_ENV
+    - name: Restore celo-monorepo cache
+      id: celo-monorepo-cache
+      uses: actions/cache@v4
+      with:
+        path: celo-monorepo
+        key: celo-monorepo-cache-${{ env.MONOREPO_COMMIT_ID }}-${{ env.CHECKOUT_MONOREPO_CACHE_VERSION }}
+        restore-keys: |
+          celo-monorepo-cache-
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: yarn
+        cache-dependency-path: celo-monorepo/yarn.lock
+    - name: Run e2e test
+      run: |
+        export E2E_TESTS_FORCE_USE_MYCELO=true
+        cd celo-monorepo/packages/celotool
+        ./ci_test_replicas.sh local "$GITHUB_WORKSPACE/geth"

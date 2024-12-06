@@ -59,7 +59,7 @@ type AccessListTx struct {
 func (tx *AccessListTx) copy() TxData {
 	cpy := &AccessListTx{
 		Nonce: tx.Nonce,
-		To:    tx.To, // TODO: copy pointed-to address
+		To:    copyAddressPtr(tx.To),
 		Data:  common.CopyBytes(tx.Data),
 		Gas:   tx.Gas,
 		// These are copied below.
@@ -94,22 +94,18 @@ func (tx *AccessListTx) copy() TxData {
 }
 
 // accessors for innerTx.
-func (tx *AccessListTx) txType() byte                         { return AccessListTxType }
-func (tx *AccessListTx) chainID() *big.Int                    { return tx.ChainID }
-func (tx *AccessListTx) protected() bool                      { return true }
-func (tx *AccessListTx) accessList() AccessList               { return tx.AccessList }
-func (tx *AccessListTx) data() []byte                         { return tx.Data }
-func (tx *AccessListTx) gas() uint64                          { return tx.Gas }
-func (tx *AccessListTx) gasPrice() *big.Int                   { return tx.GasPrice }
-func (tx *AccessListTx) gasTipCap() *big.Int                  { return tx.GasPrice }
-func (tx *AccessListTx) gasFeeCap() *big.Int                  { return tx.GasPrice }
-func (tx *AccessListTx) value() *big.Int                      { return tx.Value }
-func (tx *AccessListTx) nonce() uint64                        { return tx.Nonce }
-func (tx *AccessListTx) to() *common.Address                  { return tx.To }
-func (tx *AccessListTx) feeCurrency() *common.Address         { return nil }
-func (tx *AccessListTx) gatewayFeeRecipient() *common.Address { return nil }
-func (tx *AccessListTx) gatewayFee() *big.Int                 { return nil }
-func (tx *AccessListTx) ethCompatible() bool                  { return false }
+func (tx *AccessListTx) txType() byte           { return AccessListTxType }
+func (tx *AccessListTx) chainID() *big.Int      { return tx.ChainID }
+func (tx *AccessListTx) protected() bool        { return true }
+func (tx *AccessListTx) accessList() AccessList { return tx.AccessList }
+func (tx *AccessListTx) data() []byte           { return tx.Data }
+func (tx *AccessListTx) gas() uint64            { return tx.Gas }
+func (tx *AccessListTx) gasPrice() *big.Int     { return tx.GasPrice }
+func (tx *AccessListTx) gasTipCap() *big.Int    { return tx.GasPrice }
+func (tx *AccessListTx) gasFeeCap() *big.Int    { return tx.GasPrice }
+func (tx *AccessListTx) value() *big.Int        { return tx.Value }
+func (tx *AccessListTx) nonce() uint64          { return tx.Nonce }
+func (tx *AccessListTx) to() *common.Address    { return tx.To }
 
 func (tx *AccessListTx) rawSignatureValues() (v, r, s *big.Int) {
 	return tx.V, tx.R, tx.S
@@ -118,3 +114,9 @@ func (tx *AccessListTx) rawSignatureValues() (v, r, s *big.Int) {
 func (tx *AccessListTx) setSignatureValues(chainID, v, r, s *big.Int) {
 	tx.ChainID, tx.V, tx.R, tx.S = chainID, v, r, s
 }
+
+func (tx *AccessListTx) feeCurrency() *common.Address         { return nil }
+func (tx *AccessListTx) gatewayFeeRecipient() *common.Address { return nil }
+func (tx *AccessListTx) gatewayFee() *big.Int                 { return nil }
+func (tx *AccessListTx) ethCompatible() bool                  { return false }
+func (tx *AccessListTx) maxFeeInFeeCurrency() *big.Int        { return nil }

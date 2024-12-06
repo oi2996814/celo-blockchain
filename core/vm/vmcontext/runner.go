@@ -4,7 +4,6 @@ import (
 	"math/big"
 
 	"github.com/celo-org/celo-blockchain/common"
-	"github.com/celo-org/celo-blockchain/core/state"
 	"github.com/celo-org/celo-blockchain/core/types"
 	"github.com/celo-org/celo-blockchain/core/vm"
 )
@@ -18,10 +17,6 @@ type evmRunnerContext interface {
 
 	// GetVMConfig returns the node's vm configuration
 	GetVMConfig() *vm.Config
-
-	CurrentHeader() *types.Header
-
-	State() (*state.StateDB, error)
 }
 
 type evmRunner struct {
@@ -66,6 +61,17 @@ func (ev *evmRunner) ExecuteFrom(sender, recipient common.Address, input []byte,
 	return ret, err
 }
 
+func (ev *evmRunner) ExecuteAndDiscardChanges(recipient common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, err error) {
+	evm := ev.newEVM(VMAddress)
+	var snapshot = evm.StateDB.Snapshot()
+	if ev.dontMeterGas {
+		evm.StopGasMetering()
+	}
+	ret, _, err = evm.Call(vm.AccountRef(evm.Origin), recipient, input, gas, value)
+	evm.StateDB.RevertToSnapshot(snapshot)
+	return ret, err
+}
+
 func (ev *evmRunner) Query(recipient common.Address, input []byte, gas uint64) (ret []byte, err error) {
 	evm := ev.newEVM(VMAddress)
 	if ev.dontMeterGas {
@@ -100,6 +106,13 @@ func (sev *SharedEVMRunner) Execute(recipient common.Address, input []byte, gas 
 
 func (sev *SharedEVMRunner) ExecuteFrom(sender, recipient common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, err error) {
 	ret, _, err = sev.Call(vm.AccountRef(sender), recipient, input, gas, value)
+	return ret, err
+}
+
+func (sev *SharedEVMRunner) ExecuteAndDiscardChanges(recipient common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, err error) {
+	var snapshot = sev.StateDB.Snapshot()
+	ret, _, err = sev.Call(vm.AccountRef(VMAddress), recipient, input, gas, value)
+	sev.StateDB.RevertToSnapshot(snapshot)
 	return ret, err
 }
 

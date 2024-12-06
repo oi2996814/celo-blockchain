@@ -31,6 +31,7 @@ import (
 	"github.com/celo-org/celo-blockchain/consensus"
 	"github.com/celo-org/celo-blockchain/contracts/blockchain_parameters"
 	"github.com/celo-org/celo-blockchain/contracts/currency"
+	"github.com/celo-org/celo-blockchain/contracts/erc20gas"
 	gpm "github.com/celo-org/celo-blockchain/contracts/gasprice_minimum"
 	"github.com/celo-org/celo-blockchain/core/state"
 	"github.com/celo-org/celo-blockchain/core/types"
@@ -90,10 +91,6 @@ var (
 	// than some meaningful limit a user might use. This is not a consensus error
 	// making the transaction invalid, rather a DOS protection.
 	ErrOversizedData = errors.New("oversized data")
-
-	// ErrTransfersFrozen is returned if a transaction attempts to transfer between
-	// non-whitelisted addresses while transfers are frozen.
-	ErrTransfersFrozen = errors.New("transfers are currently frozen")
 )
 
 var (
@@ -121,6 +118,14 @@ var (
 	invalidTxMeter     = metrics.NewRegisteredMeter("txpool/invalid", nil)
 	underpricedTxMeter = metrics.NewRegisteredMeter("txpool/underpriced", nil)
 	overflowedTxMeter  = metrics.NewRegisteredMeter("txpool/overflowed", nil)
+	// throttleTxMeter counts how many transactions are rejected due to too-many-changes between
+	// txpool reorgs.
+	throttleTxMeter = metrics.NewRegisteredMeter("txpool/throttle", nil)
+	// reorgDurationTimer measures how long time a txpool reorg takes.
+	reorgDurationTimer = metrics.NewRegisteredTimer("txpool/reorgtime", nil)
+	// dropBetweenReorgHistogram counts how many drops we experience between two reorg runs. It is expected
+	// that this number is pretty low, since txpool reorgs happen very frequently.
+	dropBetweenReorgHistogram = metrics.NewRegisteredHistogram("txpool/dropbetweenreorg", nil, metrics.NewExpDecaySample(1028, 0.015))
 
 	pendingGauge = metrics.NewRegisteredGauge("txpool/pending", nil)
 	queuedGauge  = metrics.NewRegisteredGauge("txpool/queued", nil)
@@ -268,9 +273,13 @@ type TxPool struct {
 	signer      types.Signer
 	mu          sync.RWMutex
 
-	istanbul bool // Fork indicator whether we are in the istanbul stage.
-	donut    bool // Fork indicator for the Donut fork.
-	espresso bool // Fork indicator for the Espresso fork.
+	homestead     bool // Fork indicator for the homestead fork
+	istanbul      bool // Fork indicator whether we are in the istanbul stage.
+	donut         bool // Fork indicator for the Donut fork.
+	espresso      bool // Fork indicator for the Espresso fork.
+	gingerbread   bool // Fork indicator for the Gingerbread fork.
+	gingerbreadP2 bool // Fork indicator for the Gingerbread P2 fork.
+	hfork         bool // Fork indicator for the HFork.
 
 	currentState    *state.StateDB // Current state in the blockchain head
 	currentVMRunner vm.EVMRunner   // Current EVMRunner
@@ -296,6 +305,8 @@ type TxPool struct {
 	reorgShutdownCh chan struct{}  // requests shutdown of scheduleReorgLoop
 	wg              sync.WaitGroup // tracks loop, scheduleReorgLoop
 	initDoneCh      chan struct{}  // is closed once the pool is initialized (for tests)
+
+	changesSinceReorg int // A counter for how many drops we've performed in-between reorg.
 }
 
 type txpoolResetRequest struct {
@@ -652,12 +663,25 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 		return err
 	}
 
+	// CIP 57 deprecates full node incentives
+	if pool.gingerbread && tx.GatewaySet() {
+		return ErrGatewayFeeDeprecated
+	}
+
 	// Accept only legacy transactions until EIP-2718/2930 activates.
 	if !pool.espresso && tx.Type() != types.LegacyTxType {
 		return ErrTxTypeNotSupported
 	}
 	// Reject dynamic fee transactions until EIP-1559 activates.
 	if !pool.espresso && (tx.Type() == types.DynamicFeeTxType || tx.Type() == types.CeloDynamicFeeTxType) {
+		return ErrTxTypeNotSupported
+	}
+	// Reject celo dynamic fee v2 until gingerbreadP2
+	if !pool.gingerbreadP2 && tx.Type() == types.CeloDynamicFeeTxV2Type {
+		return ErrTxTypeNotSupported
+	}
+	// Reject celo denominated fee until h fork
+	if !pool.hfork && tx.Type() == types.CeloDenominatedTxType {
 		return ErrTxTypeNotSupported
 	}
 	// Reject transactions over defined size to prevent DOS attacks
@@ -696,8 +720,22 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 		return ErrNonWhitelistedFeeCurrency
 	}
 
+	// Celo denominated checks
+	if tx.Type() == types.CeloDenominatedTxType {
+		if tx.FeeCurrency() == nil {
+			return ErrDenominatedNoCurrency
+		}
+		if tx.MaxFeeInFeeCurrency() == nil {
+			return ErrDenominatedNoMax
+		}
+		// Celo denominated tx fee is over maxFeeInFeeCurrency
+		if pool.ctx().CmpValues(tx.Fee(), nil, tx.MaxFeeInFeeCurrency(), tx.FeeCurrency()) > 0 {
+			return ErrDenominatedLowMaxFee
+		}
+	}
+
 	// Drop non-local transactions under our own minimal accepted gas price or tip
-	if !local && pool.ctx().CmpValues(tx.GasTipCap(), tx.FeeCurrency(), pool.gasPrice, nil) < 0 {
+	if !local && pool.ctx().CmpValues(tx.GasTipCap(), tx.DenominatedFeeCurrency(), pool.gasPrice, nil) < 0 {
 		return ErrUnderpriced
 	}
 	// Ensure the transaction adheres to nonce ordering
@@ -722,7 +760,7 @@ func (pool *TxPool) validateTx(tx *types.Transaction, local bool) error {
 	}
 
 	ctx := pool.currentCtx.Load().(txPoolContext)
-	if ctx.CmpValues(ctx.celoGasPriceMinimumFloor, nil, tx.GasPrice(), tx.FeeCurrency()) > 0 {
+	if ctx.CmpValues(ctx.celoGasPriceMinimumFloor, nil, tx.GasPrice(), tx.DenominatedFeeCurrency()) > 0 {
 		log.Debug("gasPrice less than the minimum floor", "gasPrice", tx.GasPrice(), "feeCurrency", tx.FeeCurrency(), "gasPriceMinimumFloor (Celo)", ctx.celoGasPriceMinimumFloor)
 		return ErrGasPriceDoesNotExceedMinimumFloor
 	}
@@ -763,6 +801,15 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 			underpricedTxMeter.Mark(1)
 			return false, ErrUnderpriced
 		}
+		// We're about to replace a transaction. The reorg does a more thorough
+		// analysis of what to remove and how, but it runs async. We don't want to
+		// do too many replacements between reorg-runs, so we cap the number of
+		// replacements to 25% of the slots
+		if pool.changesSinceReorg > int(pool.config.GlobalSlots/4) {
+			throttleTxMeter.Mark(1)
+			return false, ErrTxPoolOverflow
+		}
+
 		// New transaction is better than our worse ones, make room for it.
 		// If it's a local transaction, forcibly discard all available transactions.
 		// Otherwise if we can't make enough room for new one, abort the operation.
@@ -774,6 +821,8 @@ func (pool *TxPool) add(tx *types.Transaction, local bool) (replaced bool, err e
 			overflowedTxMeter.Mark(1)
 			return false, ErrTxPoolOverflow
 		}
+		// Bump the counter of rejections-since-reorg
+		pool.changesSinceReorg += len(drop)
 		// Kick out the underpriced remote transactions.
 		for _, tx := range drop {
 			log.Trace("Discarding freshly underpriced transaction", "hash", tx.Hash(), "gasTipCap", tx.GasTipCap(), "gasFeeCap", tx.GasFeeCap())
@@ -1219,6 +1268,9 @@ func (pool *TxPool) scheduleReorgLoop() {
 
 // runReorg runs reset and promoteExecutables on behalf of scheduleReorgLoop.
 func (pool *TxPool) runReorg(done chan struct{}, reset *txpoolResetRequest, dirtyAccounts *accountSet, events map[common.Address]*txSortedMap) {
+	defer func(t0 time.Time) {
+		reorgDurationTimer.Update(time.Since(t0))
+	}(time.Now())
 	defer close(done)
 
 	var promoteAddrs []common.Address
@@ -1254,7 +1306,7 @@ func (pool *TxPool) runReorg(done chan struct{}, reset *txpoolResetRequest, dirt
 	// because of another transaction (e.g. higher gas price).
 	if reset != nil {
 		pool.demoteUnexecutables()
-		if reset.newHead != nil && pool.chainconfig.IsEspresso(new(big.Int).Add(reset.newHead.Number, big.NewInt(1))) {
+		if reset.newHead != nil && pool.chainconfig.IsLondon(new(big.Int).Add(reset.newHead.Number, big.NewInt(1))) {
 			pool.priced.SetBaseFee(pool.ctx())
 		} else {
 			// Prevent the price heap from growing indefinitely
@@ -1270,6 +1322,8 @@ func (pool *TxPool) runReorg(done chan struct{}, reset *txpoolResetRequest, dirt
 		highestPending := list.LastElement()
 		pool.pendingNonces.set(addr, highestPending.Nonce()+1)
 	}
+	dropBetweenReorgHistogram.Update(int64(pool.changesSinceReorg))
+	pool.changesSinceReorg = 0 // Reset change counter
 	pool.mu.Unlock()
 
 	// Notify subsystems for newly added transactions
@@ -1372,7 +1426,7 @@ func (pool *TxPool) reset(oldHead, newHead *types.Header) {
 	gasPriceMinimumFloor, _ := gpm.GetGasPriceMinimumFloor(pool.currentVMRunner)
 	// atomic store of the new txPoolContext
 	newCtx := txPoolContext{
-		NewSysContractCallCtx(pool.currentVMRunner),
+		NewSysContractCallCtx(newHead, statedb, pool.chain),
 		currency.NewManager(pool.currentVMRunner),
 		gasPriceMinimumFloor,
 	}
@@ -1388,12 +1442,20 @@ func (pool *TxPool) reset(oldHead, newHead *types.Header) {
 	pool.istanbul = pool.chainconfig.IsIstanbul(next)
 	pool.donut = pool.chainconfig.IsDonut(next)
 	pool.espresso = pool.chainconfig.IsEspresso(next)
+	pool.gingerbread = pool.chainconfig.IsGingerbread(next)
+	pool.gingerbreadP2 = pool.chainconfig.IsGingerbreadP2(next)
+	pool.hfork = pool.chainconfig.IsHFork(next)
 }
 
 // promoteExecutables moves transactions that have become processable from the
 // future queue to the set of pending transactions. During this process, all
 // invalidated transactions (low nonce, low balance) are deleted.
 func (pool *TxPool) promoteExecutables(accounts []common.Address) []*types.Transaction {
+	previousBlockNumber := pool.chain.CurrentBlock().Number()
+	// We need to prune the txs with gateway fee after gingerbread and that just happens in the fork
+	// activation block (saves unnecessary checks).
+	inGingerbreadBlockActivation := pool.chainconfig.GingerbreadBlock != nil &&
+		pool.chainconfig.GingerbreadBlock.Cmp(new(big.Int).Add(previousBlockNumber, big.NewInt(1))) == 0
 	// Track the promoted transactions to broadcast them at once
 	var promoted []*types.Transaction
 
@@ -1416,6 +1478,17 @@ func (pool *TxPool) promoteExecutables(accounts []common.Address) []*types.Trans
 		for _, feeCurrency := range allCurrencies {
 			feeCurrencyBalance, _ := currency.GetBalanceOf(pool.currentVMRunner, addr, feeCurrency)
 			balances[feeCurrency] = feeCurrencyBalance
+		}
+		// Drop transactions with gatewayFee in the gingerbread HF block
+		if inGingerbreadBlockActivation {
+			txsWithGatewayFee := list.txs.Filter(func(tx *types.Transaction) bool {
+				return tx.GatewaySet()
+			})
+			for _, tx := range txsWithGatewayFee {
+				hash := tx.Hash()
+				pool.all.Remove(hash)
+			}
+			log.Trace("Removed queued transactions with gatewayFee", "count", len(txsWithGatewayFee))
 		}
 		// Drop all transactions that are too costly (low balance or out of gas)
 		drops, _ := list.Filter(pool.currentState.GetBalance(addr), balances, pool.currentMaxGas)
@@ -1665,62 +1738,25 @@ func (pool *TxPool) demoteUnexecutables() {
 // ValidateTransactorBalanceCoversTx validates transactor has enough funds to cover transaction cost, the rules are consistent with state_transition.
 //
 // For native token(CELO) as feeCurrency:
-//   - Pre-Espresso: it ensures balance >= GasPrice * gas + value + gatewayFee (1)
-//   - Post-Espresso: it ensures balance >= GasFeeCap * gas + value + gatewayFee (2)
+//   - it ensures balance >= GasFeeCap * gas + value
+//
 // For non-native tokens(cUSD, cEUR, ...) as feeCurrency:
-//   - Pre-Espresso: it ensures balance > GasPrice * gas + gatewayFee (3)
-//   - Post-Espresso: it ensures balance >= GasFeeCap * gas + gatewayFee (4)
+//   - It executes a static call on debitGasFees, implicitly ensuring balance >= GasFeeCap * gas and that `from` is not on the token's block list
 func ValidateTransactorBalanceCoversTx(tx *types.Transaction, from common.Address, currentState *state.StateDB, currentVMRunner vm.EVMRunner, espresso bool) error {
-	if tx.FeeCurrency() == nil {
-		balance := currentState.GetBalance(from)
-		var cost *big.Int
+	if tx.FeeCurrency() != nil {
+		return erc20gas.TryDebitFees(tx, from, currentVMRunner)
+	}
+	balance := currentState.GetBalance(from)
 
-		if espresso {
-			// cost = GasFeeCap * gas + value + gatewayFee, as in (2)
-			cost = new(big.Int).SetUint64(tx.Gas())
-			cost.Mul(cost, tx.GasFeeCap())
-			cost.Add(cost, tx.Value())
-			if tx.GatewayFeeRecipient() != nil {
-				cost.Add(cost, tx.GatewayFee())
-			}
-		} else {
-			// cost = GasPrice * gas + value + gatewayFee, as in (1)
-			cost = tx.Cost()
-		}
+	// cost = GasFeeCap * gas + value
+	cost := tx.Cost()
 
-		if balance.Cmp(cost) < 0 {
-			log.Debug("ValidateTransactorBalanceCoversTx: insufficient CELO funds",
-				"from", from, "Transaction cost", cost, "to", tx.To(),
-				"gas", tx.Gas(), "gas price", tx.GasPrice(), "nonce", tx.Nonce(),
-				"value", tx.Value(), "fee currency", tx.FeeCurrency(), "balance", balance)
-			return ErrInsufficientFunds
-		}
-	} else {
-		balance, err := currency.GetBalanceOf(currentVMRunner, from, *tx.FeeCurrency())
-		if err != nil {
-			log.Debug("ValidateTransactorBalanceCoversTx: error in getting fee currency balance", "feeCurrency", tx.FeeCurrency())
-			return err
-		}
-
-		if espresso {
-			// cost = GasFeeCap * gas + gatewayFee, as in (4)
-			cost := new(big.Int).SetUint64(tx.Gas())
-			cost.Mul(cost, tx.GasFeeCap())
-			if tx.GatewayFeeRecipient() != nil {
-				cost.Add(cost, tx.GatewayFee())
-			}
-			if balance.Cmp(cost) < 0 {
-				log.Debug("ValidateTransactorBalanceCoversTx: insufficient funds", "feeCurrency", tx.FeeCurrency(), "balance", balance)
-				return ErrInsufficientFunds
-			}
-		} else {
-			// cost = GasPrice * gas + gatewayFee, as in (3)
-			cost := tx.Fee()
-			if balance.Cmp(cost) <= 0 {
-				log.Debug("ValidateTransactorBalanceCoversTx: insufficient funds", "feeCurrency", tx.FeeCurrency(), "balance", balance)
-				return ErrInsufficientFunds
-			}
-		}
+	if balance.Cmp(cost) < 0 {
+		log.Debug("ValidateTransactorBalanceCoversTx: insufficient CELO funds",
+			"from", from, "Transaction cost", cost, "to", tx.To(),
+			"gas", tx.Gas(), "gas price", tx.GasPrice(), "nonce", tx.Nonce(),
+			"value", tx.Value(), "fee currency", tx.FeeCurrency(), "balance", balance)
+		return ErrInsufficientFunds
 	}
 
 	return nil
@@ -1978,7 +2014,7 @@ func (t *txLookup) RemoteToLocals(locals *accountSet) int {
 func (t *txLookup) RemotesBelowTip(threshold *big.Int, txCtx *txPoolContext) types.Transactions {
 	found := make(types.Transactions, 0, 128)
 	t.Range(func(hash common.Hash, tx *types.Transaction, local bool) bool {
-		curr, _ := txCtx.GetCurrency(tx.FeeCurrency())
+		curr, _ := txCtx.GetCurrency(tx.DenominatedFeeCurrency())
 		if tx.GasTipCapIntCmp(curr.FromCELO(threshold)) < 0 {
 			found = append(found, tx)
 		}

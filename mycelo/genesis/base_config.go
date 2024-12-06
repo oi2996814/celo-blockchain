@@ -10,20 +10,26 @@ import (
 
 // BaseConfig creates base parameters for celo
 // Callers must complete missing pieces
-func BaseConfig() *Config {
+func BaseConfig(gingerbreadBlock *big.Int) *Config {
+	baseFeeOpCodeActivationBlock := gingerbreadBlock
 	bigInt := big.NewInt
 	bigIntStr := common.MustBigInt
 	fixed := fixed.MustNew
 	decimal := decimal.RequireFromString
+
+	if baseFeeOpCodeActivationBlock == nil {
+		baseFeeOpCodeActivationBlock = big.NewInt(0) // deactivated
+	}
 
 	return &Config{
 		SortedOracles: SortedOraclesParameters{
 			ReportExpirySeconds: 5 * Minute,
 		},
 		GasPriceMinimum: GasPriceMinimumParameters{
-			MinimumFloor:    bigInt(100000000),
-			AdjustmentSpeed: fixed("0.5"),
-			TargetDensity:   fixed("0.5"),
+			MinimumFloor:                 bigInt(100000000),
+			AdjustmentSpeed:              fixed("0.5"),
+			TargetDensity:                fixed("0.5"),
+			BaseFeeOpCodeActivationBlock: baseFeeOpCodeActivationBlock,
 		},
 		Reserve: ReserveParameters{
 			TobinTaxStalenessThreshold: 3153600000,
@@ -54,6 +60,15 @@ func BaseConfig() *Config {
 			InflationFactorUpdatePeriod: 2 * Year,
 			GoldPrice:                   fixed("1"),
 			ExchangeIdentifier:          "ExchangeEUR",
+		},
+		StableTokenBRL: StableTokenParameters{
+			Name:                        "Celo Brazilian Real",
+			Symbol:                      "cREAL",
+			Decimals:                    18,
+			Rate:                        fixed("1"),
+			InflationFactorUpdatePeriod: 2 * Year,
+			GoldPrice:                   fixed("1"),
+			ExchangeIdentifier:          "ExchangeBRL",
 		},
 		Validators: ValidatorsParameters{
 			GroupLockedGoldRequirements: LockedGoldRequirements{
@@ -100,6 +115,13 @@ func BaseConfig() *Config {
 			MinimumReports:  1,
 			Frozen:          false,
 		},
+		ExchangeBRL: ExchangeParameters{
+			Spread:          fixed("0.005"),
+			ReserveFraction: fixed("0.01"),
+			UpdateFrequency: 5 * Minute,
+			MinimumReports:  1,
+			Frozen:          false,
+		},
 		EpochRewards: EpochRewardsParameters{
 			TargetVotingYieldInitial:                     fixed("0"),      // Change to (x + 1) ^ 365 = 1.06 once Mainnet activated.
 			TargetVotingYieldAdjustmentFactor:            fixed("0"),      // Change to 1 / 3650 once Mainnet activated.,
@@ -130,12 +152,10 @@ func BaseConfig() *Config {
 			MaxAttestations:                100,
 			AttestationRequestFeeInDollars: decimal("0.05"), // use decimal rather than fixed, since we use this to multiply by
 		},
-		TransferWhitelist: TransferWhitelistParameters{},
 		GoldToken: GoldTokenParameters{
 			Frozen: false,
 		},
 		Blockchain: BlockchainParameters{
-			Version:                 Version{1, 0, 0},
 			GasForNonGoldCurrencies: 50000,
 			BlockGasLimit:           13000000,
 		},
@@ -154,13 +174,42 @@ func BaseConfig() *Config {
 			MinDeposit:              bigIntStr("100000000000000000000"), // 100 cGLD
 			QueueExpiry:             4 * Week,
 			DequeueFrequency:        30 * Minute,
-			ApprovalStageDuration:   30 * Minute,
 			ReferendumStageDuration: Hour,
 			ExecutionStageDuration:  Day,
 			ParticipationBaseline:   fixed("0.005"),
 			ParticipationFloor:      fixed("0.01"),
 			BaselineUpdateFactor:    fixed("0.2"),
 			BaselineQuorumFactor:    fixed("1"),
+		},
+		GrandaMento: GrandaMentoParameters{
+			MaxApprovalExchangeRateChange: fixed("0.3"),
+			Spread:                        fixed("0.005"),
+			VetoPeriodSeconds:             10,
+			StableTokenExchangeLimits: []StableTokenExchangeLimit{
+				{
+					StableToken:       "StableToken",
+					MinExchangeAmount: bigIntStr("50000000000000000000000"),
+					MaxExchangeAmount: bigIntStr("50000000000000000000000000"),
+				},
+				{
+					StableToken:       "StableTokenEUR",
+					MinExchangeAmount: bigIntStr("40000000000000000000000"),
+					MaxExchangeAmount: bigIntStr("40000000000000000000000000"),
+				},
+				{
+					StableToken:       "StableTokenBRL",
+					MinExchangeAmount: bigIntStr("40000000000000000000000"),
+					MaxExchangeAmount: bigIntStr("40000000000000000000000000"),
+				},
+			},
+		},
+		FeeHandler: FeeHandlerParameters{
+			NewFeeBeneficiary: common.Address{},
+			NewBurnFraction:   fixed("0.2"),
+			Tokens:            []common.Address{},
+			Handlers:          []common.Address{},
+			NewLimits:         []*big.Int{},
+			NewMaxSlippages:   []*big.Int{},
 		},
 	}
 }

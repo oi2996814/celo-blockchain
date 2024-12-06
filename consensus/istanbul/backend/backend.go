@@ -33,7 +33,9 @@ import (
 	"github.com/celo-org/celo-blockchain/consensus/istanbul/backend/internal/replica"
 	istanbulCore "github.com/celo-org/celo-blockchain/consensus/istanbul/core"
 	"github.com/celo-org/celo-blockchain/consensus/istanbul/proxy"
+	"github.com/celo-org/celo-blockchain/consensus/istanbul/uptime"
 	"github.com/celo-org/celo-blockchain/consensus/istanbul/validator"
+	"github.com/celo-org/celo-blockchain/consensus/misc"
 	"github.com/celo-org/celo-blockchain/contracts"
 	"github.com/celo-org/celo-blockchain/contracts/election"
 	"github.com/celo-org/celo-blockchain/p2p"
@@ -341,6 +343,8 @@ type Backend struct {
 	randomSeed   []byte
 	randomSeedMu sync.Mutex
 
+	uptimeMonitor uptime.Builder
+
 	// Test hooks
 	abortCommitHook func(result *istanbulCore.StateProcessResult) bool // Method to call upon committing a proposal
 }
@@ -473,7 +477,7 @@ func (sb *Backend) ParentBlockValidators(proposal istanbul.Proposal) istanbul.Va
 }
 
 func (sb *Backend) NextBlockValidators(proposal istanbul.Proposal) (istanbul.ValidatorSet, error) {
-	istExtra, err := types.ExtractIstanbulExtra(proposal.Header())
+	istExtra, err := proposal.Header().IstanbulExtra()
 	if err != nil {
 		return nil, err
 	}
@@ -607,6 +611,22 @@ func (sb *Backend) Verify(proposal istanbul.Proposal) (*istanbulCore.StateProces
 		sb.logger.Error("verify - Error in getting the block's parent's state", "parentHash", block.Header().ParentHash.Hex(), "err", err)
 		return nil, 0, err
 	}
+	if sb.chain.Config().IsGingerbread(block.Number()) {
+		parent := sb.chain.GetHeader(block.Header().ParentHash, block.Header().Number.Uint64()-1)
+
+		vmRunnerParent := sb.chain.NewEVMRunner(parent, state)
+		// Verify the header's EIP-1559 attributes.
+		if err := misc.VerifyEip1559Header(sb.chain.Config(), parent, block.Header(), vmRunnerParent); err != nil {
+			return nil, 0, err
+		}
+	}
+
+	if sb.chain.Config().IsGingerbreadP2(block.Number()) {
+		if err := core.ValidateBlockSize(block, params.MaxTxDataPerBlock); err != nil {
+			sb.logger.Error("verify - Error in validating txs block size", "err", err)
+			return nil, 0, err
+		}
+	}
 
 	// Apply this block's transactions to update the state
 	receipts, logs, usedGas, err := sb.processBlock(block, state)
@@ -647,7 +667,7 @@ func (sb *Backend) verifyValSetDiff(proposal istanbul.Proposal, block *types.Blo
 	header := block.Header()
 
 	// Ensure that the extra data format is satisfied
-	istExtra, err := types.ExtractIstanbulExtra(header)
+	istExtra, err := header.IstanbulExtra()
 	if err != nil {
 		return err
 	}
@@ -803,7 +823,7 @@ func (sb *Backend) GetCurrentHeadBlockAndAuthor() (istanbul.Proposal, common.Add
 
 func (sb *Backend) LastSubject() (istanbul.Subject, error) {
 	lastProposal, _ := sb.GetCurrentHeadBlockAndAuthor()
-	istExtra, err := types.ExtractIstanbulExtra(lastProposal.Header())
+	istExtra, err := lastProposal.Header().IstanbulExtra()
 	if err != nil {
 		return istanbul.Subject{}, err
 	}
@@ -1002,6 +1022,23 @@ func (sb *Backend) RemoveProxy(node *enode.Node) error {
 	} else {
 		return proxy.ErrNodeNotProxiedValidator
 	}
+}
+
+func (sb *Backend) OnBlockInsertion(header *types.Header, state *state.StateDB) error {
+	return sb.retrieveUptimeScoreBuilder(header, state).ProcessHeader(header)
+}
+
+func (sb *Backend) retrieveUptimeScoreBuilder(header *types.Header, state *state.StateDB) uptime.Builder {
+	epoch := istanbul.GetEpochNumber(header.Number.Uint64(), sb.EpochSize())
+
+	if sb.uptimeMonitor == nil || sb.uptimeMonitor.GetEpoch() != epoch {
+		valSet := sb.GetValidators(header.Number, header.Hash())
+		lookbackWindow := sb.LookbackWindow(header, state)
+		builder := uptime.NewMonitor(sb.EpochSize(), epoch, lookbackWindow, len(valSet))
+		headersProvider := istanbul.NewHeadersProvider(sb.chain)
+		sb.uptimeMonitor = uptime.NewAutoFixBuilder(builder, headersProvider)
+	}
+	return sb.uptimeMonitor
 }
 
 // VerifyPendingBlockValidatorSignature will verify that the message sender is a validator that is responsible

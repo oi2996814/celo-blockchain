@@ -18,7 +18,6 @@ package bls
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"math/big"
 
@@ -112,10 +111,6 @@ var vmBlockCtx = vm.BlockContext{
 	BlockNumber: new(big.Int).Set(testHeader.Number),
 	Time:        new(big.Int).SetUint64(testHeader.Time),
 
-	GetRegisteredAddress: func(evm *vm.EVM, registryId common.Hash) (common.Address, error) {
-		return common.ZeroAddress, errors.New("not implemented: GetAddressFromRegistry")
-	},
-
 	EpochSize:         100,
 	GetValidators:     getValidators,
 	GetHeaderByNumber: getHeaderByNumber,
@@ -166,16 +161,18 @@ func checkInput(id byte, inputLen int) bool {
 	panic("programmer error")
 }
 
-// The fuzzer functions must return
-// 1 if the fuzzer should increase priority of the
-//    given input during subsequent fuzzing (for example, the input is lexically
-//    correct and was parsed successfully);
-// -1 if the input must not be added to corpus even if gives new coverage; and
-// 0  otherwise
+// The function must return
+//
+//   - 1 if the fuzzer should increase priority of the
+//     given input during subsequent fuzzing (for example, the input is lexically
+//     correct and was parsed successfully);
+//   - -1 if the input must not be added to corpus even if gives new coverage; and
+//   - 0 otherwise
+//
 // other values are reserved for future use.
 func fuzz(id byte, data []byte) int {
 	// Even on bad input, it should not crash, so we still test the gas calc
-	precompile := vm.PrecompiledContractsE[common.BytesToAddress([]byte{id})]
+	precompile := vm.PrecompiledContractsEspresso[common.BytesToAddress([]byte{id})]
 	gas := precompile.RequiredGas(data)
 	if !checkInput(id, len(data)) {
 		return 0
@@ -186,7 +183,7 @@ func fuzz(id byte, data []byte) int {
 	}
 	cpy := make([]byte, len(data))
 	copy(cpy, data)
-	_, err := precompile.Run(cpy, common.HexToAddress("1337"), mockEVM)
+	_, err := precompile.Run(cpy, vm.NewContext(common.HexToAddress("1337"), mockEVM))
 	if !bytes.Equal(cpy, data) {
 		panic(fmt.Sprintf("input data modified, precompile %d: %x %x", id, data, cpy))
 	}

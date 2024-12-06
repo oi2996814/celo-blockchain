@@ -2,9 +2,11 @@ package main
 
 import (
 	"fmt"
+	"math/big"
 	"os"
 	"path"
 
+	"github.com/celo-org/celo-blockchain/common"
 	"github.com/celo-org/celo-blockchain/internal/fileutils"
 	"github.com/celo-org/celo-blockchain/log"
 	"github.com/celo-org/celo-blockchain/mycelo/env"
@@ -40,6 +42,26 @@ var templateFlags = []cli.Flag{
 	cli.StringFlag{
 		Name:  "mnemonic",
 		Usage: "Mnemonic to generate accounts",
+	},
+	cli.Int64Flag{
+		Name:  "forks.churrito",
+		Usage: "Optional flag to allow churrito fork overwriting (default: 0, disable: -1)",
+	},
+	cli.Int64Flag{
+		Name:  "forks.donut",
+		Usage: "Optional flag to allow donut fork overwriting (default: 0, disable: -1)",
+	},
+	cli.Int64Flag{
+		Name:  "forks.espresso",
+		Usage: "Optional flag to allow espresso fork overwriting (default: 0, disable: -1)",
+	},
+	cli.Int64Flag{
+		Name:  "forks.gingerbread",
+		Usage: "Optional flag to allow gingerbread fork overwriting (default: 0, disable: -1)",
+	},
+	cli.Int64Flag{
+		Name:  "forks.gingerbreadp2",
+		Usage: "Optional flag to allow gingerbread p2 fork overwriting (default: 0, disable: -1)",
 	},
 }
 
@@ -82,7 +104,7 @@ var createGenesisFromConfigCommand = cli.Command{
 func readBuildPath(ctx *cli.Context) (string, error) {
 	buildpath := ctx.String(buildpathFlag.Name)
 	if buildpath == "" {
-		buildpath = path.Join(os.Getenv("CELO_MONOREPO"), "packages/protocol/build/contracts")
+		buildpath = path.Join(os.Getenv("CELO_MONOREPO"), "packages/protocol/build")
 		if fileutils.FileExists(buildpath) {
 			log.Info("Missing --buildpath flag, using CELO_MONOREPO derived path", "buildpath", buildpath)
 		} else {
@@ -110,8 +132,20 @@ func envFromTemplate(ctx *cli.Context, workdir string) (*env.Environment, *genes
 		env.Accounts().Mnemonic = ctx.String("mnemonic")
 	}
 
+	var gingerbreadBlock *big.Int
+	if ctx.IsSet("forks.gingerbread") {
+		gingerbreadBlockNumber := ctx.Int64("forks.gingerbread")
+		if gingerbreadBlockNumber < 0 {
+			gingerbreadBlock = nil
+		} else {
+			gingerbreadBlock = big.NewInt(gingerbreadBlockNumber)
+		}
+	} else {
+		gingerbreadBlock = common.Big1
+	}
+
 	// Genesis config
-	genesisConfig, err := template.createGenesisConfig(env)
+	genesisConfig, err := template.createGenesisConfig(env, gingerbreadBlock)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -125,6 +159,42 @@ func envFromTemplate(ctx *cli.Context, workdir string) (*env.Environment, *genes
 	}
 	if ctx.IsSet("blockgaslimit") {
 		genesisConfig.Blockchain.BlockGasLimit = ctx.Uint64("blockgaslimit")
+	}
+
+	if ctx.IsSet("forks.churrito") {
+		churritoBlockNumber := ctx.Int64("forks.churrito")
+		if churritoBlockNumber < 0 {
+			genesisConfig.Hardforks.ChurritoBlock = nil
+		} else {
+			genesisConfig.Hardforks.ChurritoBlock = big.NewInt(churritoBlockNumber)
+		}
+	}
+
+	if ctx.IsSet("forks.donut") {
+		donutBlockNumber := ctx.Int64("forks.donut")
+		if donutBlockNumber < 0 {
+			genesisConfig.Hardforks.DonutBlock = nil
+		} else {
+			genesisConfig.Hardforks.DonutBlock = big.NewInt(donutBlockNumber)
+		}
+	}
+
+	if ctx.IsSet("forks.espresso") {
+		espressoBlockNumber := ctx.Int64("forks.espresso")
+		if espressoBlockNumber < 0 {
+			genesisConfig.Hardforks.EspressoBlock = nil
+		} else {
+			genesisConfig.Hardforks.EspressoBlock = big.NewInt(espressoBlockNumber)
+		}
+	}
+
+	if ctx.IsSet("forks.gingerbreadp2") {
+		gingerbreadP2BlockNumber := ctx.Int64("forks.gingerbreadp2")
+		if gingerbreadP2BlockNumber < 0 {
+			genesisConfig.Hardforks.GingerbreadP2Block = nil
+		} else {
+			genesisConfig.Hardforks.GingerbreadP2Block = big.NewInt(gingerbreadP2BlockNumber)
+		}
 	}
 
 	return env, genesisConfig, nil

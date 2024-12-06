@@ -7,7 +7,7 @@
 .PHONY: geth-linux-arm geth-linux-arm-5 geth-linux-arm-6 geth-linux-arm-7 geth-linux-arm64
 .PHONY: geth-darwin geth-darwin-amd64
 .PHONY: geth-windows geth-windows-386 geth-windows-amd64
-.PHONY: prepare-system-contracts $(MONOREPO_PATH)
+.PHONY: prepare prepare-system-contracts prepare-ethersjs-project
 
 GOBIN = ./build/bin
 GO ?= latest
@@ -22,12 +22,10 @@ else
 	OS = linux
 endif
 
-MONOREPO_COMMIT=celo-core-contracts-v3.rc0
-
 # We checkout the monorepo as a sibling to the celo-blockchain dir because the
 # huge amount of files in the monorepo interferes with tooling such as gopls,
 # which becomes very slow.
-MONOREPO_PATH=../.celo-blockchain-monorepo-checkout
+MONOREPO_PATH=../.celo-blockchain-monorepo-checkouts/$(shell cat monorepo_commit)
 
 # This either evaluates to the contract source files if they exist or NOT_FOUND
 # if celo-monorepo has not been checked out yet.
@@ -47,50 +45,67 @@ geth:
 	@echo "Done building."
 	@echo "Run \"$(GOBIN)/geth\" to launch geth."
 
-# This rule checks out celo-monorepo under MONOREPO_PATH at commit
-# MONOREPO_COMMIT and compiles the system solidty contracts. It then copies the
+prepare: prepare-system-contracts prepare-ethersjs-project
+
+prepare-ethersjs-project: ./e2e_test/ethersjs-api-check/node_modules
+
+./e2e_test/ethersjs-api-check/node_modules: ./e2e_test/ethersjs-api-check/package.json ./e2e_test/ethersjs-api-check/package-lock.json
+	@cd ./e2e_test/ethersjs-api-check && npm ci
+
+# This rule checks out celo-monorepo under MONOREPO_PATH at the commit contained in
+# monorepo_commit and compiles the system solidity contracts. It then copies the
 # compiled contracts from the monorepo to the compiled-system-contracts, so
 # that this repo can always access the contracts at a consistent path.
 prepare-system-contracts: $(MONOREPO_PATH)/packages/protocol/build
 	@rm -rf compiled-system-contracts
-	@cp -a $(MONOREPO_PATH)/packages/protocol/build/contracts compiled-system-contracts
+	@cp -R $(MONOREPO_PATH)/packages/protocol/build compiled-system-contracts
 
 # If any of the source files in CONTRACT_SOURCE_FILES are more recent than the
 # build dir or the build dir does not exist then we remove the build dir, yarn
 # install and rebuild the contracts.
 $(MONOREPO_PATH)/packages/protocol/build: $(CONTRACT_SOURCE_FILES)
-	@node --version | grep "^v10" || (echo "node v10 is required to build the monorepo (nvm use 10)" && exit 1)
+	@node --version | grep "^v18" || (echo "node v18 is required to build the monorepo (nvm use 18)" && exit 1)
 	@echo Running yarn install and compiling contracts
 	@cd $(MONOREPO_PATH) && rm -rf packages/protocol/build && yarn && cd packages/protocol && yarn run build:sol
 
 
-# The source files depend on the MONOREPO_PATH rule to ensure that the monorepo is
-# checked out before we try to build.
+# This target serves as an intermediate step to avoid running the
+# $(MONOREPO_PATH) target once per contract source file.  This could also be
+# achieved by using the group targets separator '&:' instead of just ':', but
+# that functionality was added in make version 4.3 which doesn't seem to be
+# readily available on most systems yet. So although this rule will be run once
+# for each source file, since it is empty that is very quick. $(MONOREPO_PATH)
+# as a prerequisite of this will be run at most once.
 $(CONTRACT_SOURCE_FILES): $(MONOREPO_PATH)
 
-# Clone the monorepo.
+# Clone the monorepo at the commit in the file `monorepo_commit`.
 #
-# If the repo has not been cloned then clone it at the MONOREPO_COMMIT and
-# store that commit in a file.  Otherwise if the repo has been cloned and
-# MONOREPO_COMMIT doesn't match the contents of current_commit then checkout
-# the new commit, and update the file that stores the current commit.  This
-# will fail if there are local changes.
-$(MONOREPO_PATH):
+# The checkouts are kept separate by commit to make switching between commits. Use `make clean-old-monorepos` to remove all checkouts but the once currently indicated by `monorepo_commit`.
+$(MONOREPO_PATH): monorepo_commit
 	@set -e; \
+	mc=`cat monorepo_commit`; \
+	echo "monorepo_commit is $${mc}"; \
+	if git ls-remote --heads --exit-code git@github.com:celo-org/celo-monorepo.git $${mc} > /dev/null 2>&1; \
+	then \
+		echo "Expected commit hash or tag in 'monorepo_commit' instead found branch name '$${mc}'"; \
+		exit 1; \
+	fi; \
 	if  [ ! -e $(MONOREPO_PATH) ]; \
 	then \
-		echo "Cloning monorepo at $(MONOREPO_COMMIT)"; \
-		git clone --quiet --depth 1 --branch $(MONOREPO_COMMIT) https://github.com/celo-org/celo-monorepo.git $(MONOREPO_PATH); \
-		echo $(MONOREPO_COMMIT) > $(MONOREPO_PATH)/current_commit; \
-	elif [ $(MONOREPO_COMMIT) != $(shell cat $(MONOREPO_PATH)/current_commit 2>/dev/null || echo "") ]; \
-	then \
-		echo "Checking out monorepo at $(MONOREPO_COMMIT)"; \
-		cd $(MONOREPO_PATH); \
-		git fetch --quiet --depth 1 origin $(MONOREPO_COMMIT); \
+		echo "Cloning monorepo at $${mc}"; \
+		mkdir -p $(MONOREPO_PATH) && cd $(MONOREPO_PATH); \
+		git init; \
+		git remote add origin https://github.com/celo-org/celo-monorepo.git; \
+		git fetch --quiet --depth 1 origin $${mc}; \
 		git checkout FETCH_HEAD; \
-		sleep 0.5; \
-		echo $(MONOREPO_COMMIT) > current_commit; \
 	fi
+
+
+clean-old-monorepos:
+	@all_repos_dir=$$(realpath $(MONOREPO_PATH)/..); \
+	delete_dirs=$$(ls -d -1 $${all_repos_dir}/*/ | grep -v $$(cat monorepo_commit)); \
+	echo Deleting $$delete_dirs; \
+	rm -fr $$delete_dirs
 
 
 geth-musl:
@@ -146,7 +161,7 @@ ios:
 	# Geth.framework is a static framework, so we have to also keep the other static libs it depends on
 	# in order to link it to the final app
 	# One day gomobile will probably support xcframework which would solve this ;-)
-	cp -f "$$(go list -m -f "{{ .Dir }}" github.com/celo-org/celo-bls-go)/libs/universal/libbls_snark_sys.a" .
+	cp -f "$$(go list -m -f "{{ .Dir }}" github.com/celo-org/celo-bls-go-ios)/libs/universal/libbls_snark_sys.a" .
 	@echo "Done building."
 	@echo "Import \"$(GOBIN)/Geth.framework\" to use the library."
 

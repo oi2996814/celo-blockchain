@@ -41,6 +41,7 @@ type TransactionArgs struct {
 	MaxFeePerGas         *hexutil.Big    `json:"maxFeePerGas"`
 	MaxPriorityFeePerGas *hexutil.Big    `json:"maxPriorityFeePerGas"`
 	FeeCurrency          *common.Address `json:"feeCurrency"`
+	MaxFeeInFeeCurrency  *hexutil.Big    `json:"maxFeeInFeeCurrency"`
 	GatewayFeeRecipient  *common.Address `json:"gatewayFeeRecipient"`
 	GatewayFee           *hexutil.Big    `json:"gatewayFee"`
 	Value                *hexutil.Big    `json:"value"`
@@ -86,12 +87,14 @@ func (args *TransactionArgs) setDefaults(ctx context.Context, b Backend) error {
 		return errors.New("both gasPrice and (maxFeePerGas or maxPriorityFeePerGas) specified")
 	}
 	// After london, default to 1559 unless gasPrice is set
-	head := b.CurrentHeader()
+	currentBlockNumber := b.CurrentHeader().Number
+	isGingerbread := b.ChainConfig().IsGingerbread(currentBlockNumber)
+
 	// If user specifies both maxPriorityfee and maxFee, then we do not
 	// need to consult the chain for defaults. It's definitely a London tx.
 	if args.MaxPriorityFeePerGas == nil || args.MaxFeePerGas == nil {
 		// In this clause, user left some fields unspecified.
-		if b.ChainConfig().IsEspresso(head.Number) {
+		if b.ChainConfig().IsEspresso(currentBlockNumber) {
 			if args.GasPrice == nil || args.GasPrice.ToInt().Cmp(big.NewInt(0)) == 0 {
 				if args.MaxPriorityFeePerGas == nil {
 					tip, err := b.SuggestGasTipCap(ctx, args.FeeCurrency)
@@ -149,7 +152,7 @@ func (args *TransactionArgs) setDefaults(ctx context.Context, b Backend) error {
 	if args.To == nil && len(args.data()) == 0 {
 		return errors.New(`contract creation without any data provided`)
 	}
-	if args.GatewayFeeRecipient == nil && !args.EthCompatible {
+	if args.GatewayFeeRecipient == nil && !args.EthCompatible && !isGingerbread {
 		recipient := b.GatewayFeeRecipient()
 		if (recipient != common.Address{}) {
 			args.GatewayFeeRecipient = &recipient
@@ -159,6 +162,7 @@ func (args *TransactionArgs) setDefaults(ctx context.Context, b Backend) error {
 	if args.Gas == nil {
 		// These fields are immutable during the estimation, safe to
 		// pass the pointer directly.
+		data := args.data()
 		callArgs := TransactionArgs{
 			From:                 args.From,
 			To:                   args.To,
@@ -169,7 +173,7 @@ func (args *TransactionArgs) setDefaults(ctx context.Context, b Backend) error {
 			GatewayFee:           args.GatewayFee,
 			GatewayFeeRecipient:  args.GatewayFeeRecipient,
 			Value:                args.Value,
-			Data:                 args.Data,
+			Data:                 (*hexutil.Bytes)(&data),
 			AccessList:           args.AccessList,
 		}
 		pendingBlockNr := rpc.BlockNumberOrHashWithNumber(rpc.PendingBlockNumber)
@@ -180,7 +184,7 @@ func (args *TransactionArgs) setDefaults(ctx context.Context, b Backend) error {
 		args.Gas = &estimated
 		log.Trace("Estimate gas usage automatically", "gas", args.Gas)
 	}
-	if args.GatewayFeeRecipient != nil && args.GatewayFee == nil {
+	if args.GatewayFeeRecipient != nil && args.GatewayFee == nil && !isGingerbread {
 		args.GatewayFee = (*hexutil.Big)(b.GatewayFee())
 	}
 	if args.ChainID == nil {
@@ -190,7 +194,7 @@ func (args *TransactionArgs) setDefaults(ctx context.Context, b Backend) error {
 	return nil
 }
 
-// ToMessage converts th transaction arguments to the Message type used by the
+// ToMessage converts the transaction arguments to the Message type used by the
 // core evm. This method is used in calls and traces that do not require a real
 // live transaction.
 func (args *TransactionArgs) ToMessage(globalGasCap uint64, baseFee *big.Int) (types.Message, error) {
@@ -232,7 +236,7 @@ func (args *TransactionArgs) ToMessage(globalGasCap uint64, baseFee *big.Int) (t
 			gasPrice = args.GasPrice.ToInt()
 			gasFeeCap, gasTipCap = gasPrice, gasPrice
 		} else {
-			// User specified 1559 gas feilds (or none), use those
+			// User specified 1559 gas fields (or none), use those
 			gasFeeCap = new(big.Int)
 			if args.MaxFeePerGas != nil {
 				gasFeeCap = args.MaxFeePerGas.ToInt()
@@ -257,7 +261,8 @@ func (args *TransactionArgs) ToMessage(globalGasCap uint64, baseFee *big.Int) (t
 	if args.AccessList != nil {
 		accessList = *args.AccessList
 	}
-	msg := types.NewMessage(addr, args.To, 0, value, gas, gasPrice, gasFeeCap, gasTipCap, args.FeeCurrency, args.GatewayFeeRecipient, args.GatewayFee.ToInt(), data, accessList, args.EthCompatible, false)
+	maxFeeInFeeCurrency := args.MaxFeeInFeeCurrency.ToInt()
+	msg := types.NewMessage(addr, args.To, 0, value, gas, gasPrice, gasFeeCap, gasTipCap, args.FeeCurrency, maxFeeInFeeCurrency, args.GatewayFeeRecipient, args.GatewayFee.ToInt(), data, accessList, args.EthCompatible, true)
 	return msg, nil
 }
 
@@ -271,8 +276,9 @@ func (args *TransactionArgs) toTransaction() *types.Transaction {
 		if args.AccessList != nil {
 			al = *args.AccessList
 		}
-		if args.FeeCurrency != nil || args.GatewayFeeRecipient != nil || args.GatewayFee != nil {
-			data = &types.CeloDynamicFeeTx{
+
+		if args.FeeCurrency != nil && args.MaxFeeInFeeCurrency != nil {
+			data = &types.CeloDenominatedTx{
 				To:                  args.To,
 				ChainID:             (*big.Int)(args.ChainID),
 				Nonce:               uint64(*args.Nonce),
@@ -280,11 +286,23 @@ func (args *TransactionArgs) toTransaction() *types.Transaction {
 				GasFeeCap:           (*big.Int)(args.MaxFeePerGas),
 				GasTipCap:           (*big.Int)(args.MaxPriorityFeePerGas),
 				FeeCurrency:         args.FeeCurrency,
-				GatewayFeeRecipient: args.GatewayFeeRecipient,
-				GatewayFee:          (*big.Int)(args.GatewayFee),
+				MaxFeeInFeeCurrency: (*big.Int)(args.MaxFeeInFeeCurrency),
 				Value:               (*big.Int)(args.Value),
 				Data:                args.data(),
 				AccessList:          al,
+			}
+		} else if args.FeeCurrency != nil {
+			data = &types.CeloDynamicFeeTxV2{
+				To:          args.To,
+				ChainID:     (*big.Int)(args.ChainID),
+				Nonce:       uint64(*args.Nonce),
+				Gas:         uint64(*args.Gas),
+				GasFeeCap:   (*big.Int)(args.MaxFeePerGas),
+				GasTipCap:   (*big.Int)(args.MaxPriorityFeePerGas),
+				FeeCurrency: args.FeeCurrency,
+				Value:       (*big.Int)(args.Value),
+				Data:        args.data(),
+				AccessList:  al,
 			}
 		} else {
 			data = &types.DynamicFeeTx{

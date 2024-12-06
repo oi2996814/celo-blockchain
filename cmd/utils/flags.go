@@ -23,6 +23,7 @@ import (
 	"io"
 	"io/ioutil"
 	"math"
+	"math/big"
 	"path/filepath"
 	godebug "runtime/debug"
 	"strconv"
@@ -122,10 +123,6 @@ var (
 		Name:  "keystore",
 		Usage: "Directory for the keystore (default = inside the datadir)",
 	}
-	NoUSBFlag = cli.BoolFlag{
-		Name:  "nousb",
-		Usage: "Disables monitoring for and managing USB hardware wallets (deprecated)",
-	}
 	USBFlag = cli.BoolFlag{
 		Name:  "usb",
 		Usage: "Enable monitoring and management of USB hardware wallets",
@@ -154,6 +151,7 @@ var (
 	DeveloperPeriodFlag = cli.IntFlag{
 		Name:  "dev.period",
 		Usage: "Block period to use in developer mode (0 = mine only if transaction pending)",
+		Value: 1,
 	}
 	IdentityFlag = cli.StringFlag{
 		Name:  "identity",
@@ -240,9 +238,14 @@ var (
 	}
 
 	// Hard fork activation overrides
-	OverrideEHardforkFlag = cli.Uint64Flag{
-		Name:  "override.espresso",
-		Usage: "Manually specify the espresso fork block, overriding the bundled setting",
+	OverrideHForkFlag = cli.Uint64Flag{
+		Name:  "override.hfork",
+		Usage: "Manually specify the hfork block, overriding the bundled setting",
+	}
+
+	L2MigrationBlockFlag = cli.Uint64Flag{
+		Name:  "l2migrationblock",
+		Usage: "Block number at which to halt the network for Celo L2 migration. This is the first block of Celo as an L2, and one after the last block of Celo as an L1. If unset or set to 0, no halt will occur.",
 	}
 
 	BloomFilterSizeFlag = cli.Uint64Flag{
@@ -418,6 +421,15 @@ var (
 		Name:  "miner.extradata",
 		Usage: "Block extra data set by the miner (default = client version)",
 	}
+	CeloFeeCurrencyDefault = cli.Float64Flag{
+		Name:  "celo.feecurrency.default",
+		Usage: "Default fraction of block gas limit available for TXs paid with a whitelisted alternative currency",
+		Value: 0.5,
+	}
+	CeloFeeCurrencyLimits = cli.StringFlag{
+		Name:  "celo.feecurrency.limits",
+		Usage: "Comma separated currency address-to-block percentage mappings (<address>=<fraction>)",
+	}
 
 	// Account settings
 
@@ -449,6 +461,11 @@ var (
 		Usage: "Multiplier applied to the gasEstimation rpc call (1 = gasEstimation, 1.3 = gasEstimation + 30%, etc. Defaults to 1.3)",
 		Value: ethconfig.Defaults.RPCGasInflationRate,
 	}
+	RPCGlobalGasPriceMultiplierFlag = cli.Float64Flag{
+		Name:  "rpc.gaspricemultiplier",
+		Usage: "Multiplier applied to the gasPrice rpc call (1 = gasPrice, 1.3 = gasPrice + 30%, etc. Defaults to 2.0)",
+		Value: float64(ethconfig.Defaults.RPCGasPriceMultiplier.Int64() / 100),
+	}
 	RPCGlobalGasCapFlag = cli.Uint64Flag{
 		Name:  "rpc.gascap",
 		Usage: "Sets a cap on gas that can be used in eth_call/estimateGas (0=infinite)",
@@ -470,6 +487,10 @@ var (
 		Usage: "Disables db compaction after import",
 	}
 	// RPC settings
+	DisableRPCETHCompatibility = cli.BoolFlag{
+		Name:  "disablerpcethcompatibility",
+		Usage: "If set, blocks returned from the RPC api will not contain the 'gasLimit' and 'baseFeePerGas' fields, which were added to the RPC block representation in order to improve compatibility with ethereum tooling. Note these fields do not currently exist on the internal block representation so they should be disregarded for the purposes of hashing or signing",
+	}
 
 	IPCDisabledFlag = cli.BoolFlag{
 		Name:  "ipcdisable",
@@ -505,7 +526,7 @@ var (
 	}
 	HTTPApiFlag = cli.StringFlag{
 		Name:  "http.api",
-		Usage: "API's offered over the HTTP-RPC interface",
+		Usage: "Comma separated list of API's offered over the HTTP-RPC interface choose from admin,debug,eth,istanbul,miner,net,personal,txpool,web3,les,vflux",
 		Value: "",
 	}
 	HTTPPathPrefixFlag = cli.StringFlag{
@@ -558,7 +579,7 @@ var (
 	}
 	WSApiFlag = cli.StringFlag{
 		Name:  "ws.api",
-		Usage: "API's offered over the WS-RPC interface",
+		Usage: "Comma separated list of API's offered over the WS-RPC interface choose from admin,debug,eth,istanbul,miner,net,personal,txpool,web3,les,vflux",
 		Value: "",
 	}
 	WSAllowedOriginsFlag = cli.StringFlag{
@@ -635,10 +656,6 @@ var (
 		Usage: "Specifies whether to use an in memory discovery table",
 	}
 
-	VersionCheckFlag = cli.BoolFlag{
-		Name:  "disable-version-check",
-		Usage: "Disable version check. Use if the parameter is set erroneously",
-	}
 	DNSDiscoveryFlag = cli.StringFlag{
 		Name:  "discovery.dns",
 		Usage: "Sets DNS discovery entry points (use \"\" to disable DNS)",
@@ -731,6 +748,30 @@ var (
 		Usage: "Comma-separated InfluxDB tags (key/values) attached to all measurements",
 		Value: metrics.DefaultConfig.InfluxDBTags,
 	}
+
+	MetricsEnableInfluxDBV2Flag = cli.BoolFlag{
+		Name:  "metrics.influxdbv2",
+		Usage: "Enable metrics export/push to an external InfluxDB v2 database",
+	}
+
+	MetricsInfluxDBTokenFlag = cli.StringFlag{
+		Name:  "metrics.influxdb.token",
+		Usage: "Token to authorize access to the database (v2 only)",
+		Value: metrics.DefaultConfig.InfluxDBToken,
+	}
+
+	MetricsInfluxDBBucketFlag = cli.StringFlag{
+		Name:  "metrics.influxdb.bucket",
+		Usage: "InfluxDB bucket name to push reported metrics to (v2 only)",
+		Value: metrics.DefaultConfig.InfluxDBBucket,
+	}
+
+	MetricsInfluxDBOrganizationFlag = cli.StringFlag{
+		Name:  "metrics.influxdb.organization",
+		Usage: "InfluxDB organization name (v2 only)",
+		Value: metrics.DefaultConfig.InfluxDBOrganization,
+	}
+
 	MetricsLoadTestCSVFlag = cli.StringFlag{
 		Name:  "metrics.loadtestcsvfile",
 		Usage: "Write a csv with information about the block production cycle to the given file name. If passed an empty string or non-existent, do not output csv metrics.",
@@ -933,14 +974,6 @@ func SplitAndTrim(input string) (ret []string) {
 // setHTTP creates the HTTP RPC listener interface string from the set
 // command line flags, returning empty if the HTTP endpoint is disabled.
 func setHTTP(ctx *cli.Context, cfg *node.Config) {
-	if ctx.GlobalBool(LegacyRPCEnabledFlag.Name) && cfg.HTTPHost == "" {
-		log.Warn("The flag --rpc is deprecated and will be removed June 2021, please use --http")
-		cfg.HTTPHost = "127.0.0.1"
-		if ctx.GlobalIsSet(LegacyRPCListenAddrFlag.Name) {
-			cfg.HTTPHost = ctx.GlobalString(LegacyRPCListenAddrFlag.Name)
-			log.Warn("The flag --rpcaddr is deprecated and will be removed June 2021, please use --http.addr")
-		}
-	}
 	if ctx.GlobalBool(HTTPEnabledFlag.Name) && cfg.HTTPHost == "" {
 		cfg.HTTPHost = "127.0.0.1"
 		if ctx.GlobalIsSet(HTTPListenAddrFlag.Name) {
@@ -948,34 +981,18 @@ func setHTTP(ctx *cli.Context, cfg *node.Config) {
 		}
 	}
 
-	if ctx.GlobalIsSet(LegacyRPCPortFlag.Name) {
-		cfg.HTTPPort = ctx.GlobalInt(LegacyRPCPortFlag.Name)
-		log.Warn("The flag --rpcport is deprecated and will be removed June 2021, please use --http.port")
-	}
 	if ctx.GlobalIsSet(HTTPPortFlag.Name) {
 		cfg.HTTPPort = ctx.GlobalInt(HTTPPortFlag.Name)
 	}
 
-	if ctx.GlobalIsSet(LegacyRPCCORSDomainFlag.Name) {
-		cfg.HTTPCors = SplitAndTrim(ctx.GlobalString(LegacyRPCCORSDomainFlag.Name))
-		log.Warn("The flag --rpccorsdomain is deprecated and will be removed June 2021, please use --http.corsdomain")
-	}
 	if ctx.GlobalIsSet(HTTPCORSDomainFlag.Name) {
 		cfg.HTTPCors = SplitAndTrim(ctx.GlobalString(HTTPCORSDomainFlag.Name))
 	}
 
-	if ctx.GlobalIsSet(LegacyRPCApiFlag.Name) {
-		cfg.HTTPModules = SplitAndTrim(ctx.GlobalString(LegacyRPCApiFlag.Name))
-		log.Warn("The flag --rpcapi is deprecated and will be removed June 2021, please use --http.api")
-	}
 	if ctx.GlobalIsSet(HTTPApiFlag.Name) {
 		cfg.HTTPModules = SplitAndTrim(ctx.GlobalString(HTTPApiFlag.Name))
 	}
 
-	if ctx.GlobalIsSet(LegacyRPCVirtualHostsFlag.Name) {
-		cfg.HTTPVirtualHosts = SplitAndTrim(ctx.GlobalString(LegacyRPCVirtualHostsFlag.Name))
-		log.Warn("The flag --rpcvhosts is deprecated and will be removed June 2021, please use --http.vhosts")
-	}
 	if ctx.GlobalIsSet(HTTPVirtualHostsFlag.Name) {
 		cfg.HTTPVirtualHosts = SplitAndTrim(ctx.GlobalString(HTTPVirtualHostsFlag.Name))
 	}
@@ -1426,6 +1443,37 @@ func setMiner(ctx *cli.Context, cfg *miner.Config) {
 	if ctx.GlobalIsSet(MinerExtraDataFlag.Name) {
 		cfg.ExtraData = []byte(ctx.GlobalString(MinerExtraDataFlag.Name))
 	}
+
+	cfg.FeeCurrencyDefault = ctx.GlobalFloat64(CeloFeeCurrencyDefault.Name)
+
+	defaultLimits, ok := miner.DefaultFeeCurrencyLimits[getNetworkId(ctx)]
+	if !ok {
+		defaultLimits = make(map[common.Address]float64)
+	}
+
+	cfg.FeeCurrencyLimits = defaultLimits
+
+	if ctx.GlobalIsSet(CeloFeeCurrencyLimits.Name) {
+		feeCurrencyLimits := ctx.GlobalString(CeloFeeCurrencyLimits.Name)
+
+		for _, entry := range strings.Split(feeCurrencyLimits, ",") {
+			parts := strings.Split(entry, "=")
+			if len(parts) != 2 {
+				Fatalf("Invalid fee currency limits entry: %s", entry)
+			}
+			var address common.Address
+			if err := address.UnmarshalText([]byte(parts[0])); err != nil {
+				Fatalf("Invalid fee currency address hash %s: %v", parts[0], err)
+			}
+
+			fraction, err := strconv.ParseFloat(parts[1], 64)
+			if err != nil {
+				Fatalf("Invalid block limit fraction %s: %v", parts[1], err)
+			}
+
+			cfg.FeeCurrencyLimits[address] = fraction
+		}
+	}
 }
 
 func setWhitelist(ctx *cli.Context, cfg *ethconfig.Config) {
@@ -1680,6 +1728,9 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	log.Debug("Sanitizing Go's GC trigger", "percent", int(gogc))
 	godebug.SetGCPercent(int(gogc))
 
+	if ctx.GlobalIsSet(L2MigrationBlockFlag.Name) {
+		cfg.L2MigrationBlock = new(big.Int).SetUint64(ctx.GlobalUint64(L2MigrationBlockFlag.Name))
+	}
 	if ctx.GlobalIsSet(SyncModeFlag.Name) {
 		cfg.SyncMode = *GlobalTextMarshaler(ctx, SyncModeFlag.Name).(*downloader.SyncMode)
 	}
@@ -1750,6 +1801,15 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	if ctx.GlobalIsSet(RPCGlobalGasInflationRateFlag.Name) {
 		cfg.RPCGasInflationRate = ctx.GlobalFloat64(RPCGlobalGasInflationRateFlag.Name)
 	}
+	if ctx.GlobalIsSet(RPCGlobalGasPriceMultiplierFlag.Name) {
+		floatMutliplier := ctx.GlobalFloat64(RPCGlobalGasPriceMultiplierFlag.Name)
+		if floatMutliplier < 1.0 {
+			log.Warn("Too low RPCGasPriceMultiplier, setting to 1.0", "provided value", floatMutliplier)
+			floatMutliplier = 1.0
+		}
+
+		cfg.RPCGasPriceMultiplier = big.NewInt(int64(floatMutliplier * 100))
+	}
 	if cfg.RPCGasInflationRate < 1 {
 		Fatalf("The inflation rate shouldn't be less than 1: %f", cfg.RPCGasInflationRate)
 	}
@@ -1765,6 +1825,11 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	}
 	if ctx.GlobalIsSet(RPCGlobalTxFeeCapFlag.Name) {
 		cfg.RPCTxFeeCap = ctx.GlobalFloat64(RPCGlobalTxFeeCapFlag.Name)
+	}
+
+	cfg.RPCEthCompatibility = true
+	if ctx.GlobalIsSet(DisableRPCETHCompatibility.Name) {
+		cfg.RPCEthCompatibility = false
 	}
 
 	// Disable DNS discovery by default (by using the flag's value even if it hasn't been set and so
@@ -1784,7 +1849,7 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		if !ctx.GlobalIsSet(NetworkIdFlag.Name) {
 			cfg.NetworkId = params.MainnetNetworkId
 		}
-		cfg.Genesis = core.MainnetGenesisBlock()
+		cfg.Genesis = core.DefaultGenesisBlock()
 		SetDNSDiscoveryDefaults(cfg, params.MainnetGenesisHash)
 	case ctx.GlobalBool(BaklavaFlag.Name):
 		if !ctx.GlobalIsSet(NetworkIdFlag.Name) {
@@ -1831,10 +1896,21 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		if err := ks.Unlock(developer, passphrase); err != nil {
 			Fatalf("Failed to unlock developer account: %v", err)
 		}
-		log.Info("Using developer account", "address", developer.Address)
+
+		// These must be set in order for dev mode to work out of the box with the developer account.
+		if cfg.Miner.Validator == (common.Address{}) {
+			log.Info("Setting developer account as validator", "address", developer.Address)
+			cfg.Miner.Validator = developer.Address
+		}
+		if cfg.TxFeeRecipient == (common.Address{}) {
+			log.Info("Setting developer account as txFeeRecipient", "address", developer.Address)
+			cfg.TxFeeRecipient = developer.Address
+		}
+
+		log.Info("Using developer account as validator & txFeeRecipient", "address", developer.Address)
 
 		// Create a new developer genesis block or reuse existing one
-		cfg.Genesis = core.DeveloperGenesisBlock()
+		cfg.Genesis = core.DeveloperGenesisBlock(ctx.GlobalUint64(DeveloperPeriodFlag.Name))
 		if ctx.GlobalIsSet(DataDirFlag.Name) {
 			// Check if we have an already initialized chain and fall back to
 			// that if so. Otherwise we need to generate a new genesis spec.
@@ -1914,11 +1990,36 @@ func SetupMetrics(ctx *cli.Context) {
 		log.Info("Enabling metrics collection")
 
 		var (
-			enableExport = ctx.GlobalBool(MetricsEnableInfluxDBFlag.Name)
-			endpoint     = ctx.GlobalString(MetricsInfluxDBEndpointFlag.Name)
-			database     = ctx.GlobalString(MetricsInfluxDBDatabaseFlag.Name)
-			username     = ctx.GlobalString(MetricsInfluxDBUsernameFlag.Name)
-			password     = ctx.GlobalString(MetricsInfluxDBPasswordFlag.Name)
+			enableExport   = ctx.GlobalBool(MetricsEnableInfluxDBFlag.Name)
+			enableExportV2 = ctx.GlobalBool(MetricsEnableInfluxDBV2Flag.Name)
+		)
+
+		if enableExport || enableExportV2 {
+			CheckExclusive(ctx, MetricsEnableInfluxDBFlag, MetricsEnableInfluxDBV2Flag)
+
+			v1FlagIsSet := ctx.GlobalIsSet(MetricsInfluxDBUsernameFlag.Name) ||
+				ctx.GlobalIsSet(MetricsInfluxDBPasswordFlag.Name)
+
+			v2FlagIsSet := ctx.GlobalIsSet(MetricsInfluxDBTokenFlag.Name) ||
+				ctx.GlobalIsSet(MetricsInfluxDBOrganizationFlag.Name) ||
+				ctx.GlobalIsSet(MetricsInfluxDBBucketFlag.Name)
+
+			if enableExport && v2FlagIsSet {
+				Fatalf("Flags --influxdb.metrics.organization, --influxdb.metrics.token, --influxdb.metrics.bucket are only available for influxdb-v2")
+			} else if enableExportV2 && v1FlagIsSet {
+				Fatalf("Flags --influxdb.metrics.username, --influxdb.metrics.password are only available for influxdb-v1")
+			}
+		}
+
+		var (
+			endpoint = ctx.GlobalString(MetricsInfluxDBEndpointFlag.Name)
+			database = ctx.GlobalString(MetricsInfluxDBDatabaseFlag.Name)
+			username = ctx.GlobalString(MetricsInfluxDBUsernameFlag.Name)
+			password = ctx.GlobalString(MetricsInfluxDBPasswordFlag.Name)
+
+			token        = ctx.GlobalString(MetricsInfluxDBTokenFlag.Name)
+			bucket       = ctx.GlobalString(MetricsInfluxDBBucketFlag.Name)
+			organization = ctx.GlobalString(MetricsInfluxDBOrganizationFlag.Name)
 		)
 
 		if enableExport {
@@ -1927,6 +2028,12 @@ func SetupMetrics(ctx *cli.Context) {
 			log.Info("Enabling metrics export to InfluxDB")
 
 			go influxdb.InfluxDBWithTags(metrics.DefaultRegistry, 10*time.Second, endpoint, database, username, password, "geth.", tagsMap)
+		} else if enableExportV2 {
+			tagsMap := SplitTagsFlag(ctx.GlobalString(MetricsInfluxDBTagsFlag.Name))
+
+			log.Info("Enabling metrics export to InfluxDB (v2)")
+
+			go influxdb.InfluxDBV2WithTags(metrics.DefaultRegistry, 10*time.Second, endpoint, token, bucket, organization, "geth.", tagsMap)
 		}
 
 		if ctx.GlobalIsSet(MetricsHTTPFlag.Name) {
@@ -1983,7 +2090,7 @@ func MakeGenesis(ctx *cli.Context) *core.Genesis {
 	var genesis *core.Genesis
 	switch {
 	case ctx.GlobalBool(MainnetFlag.Name):
-		genesis = core.MainnetGenesisBlock()
+		genesis = core.DefaultGenesisBlock()
 	case ctx.GlobalBool(BaklavaFlag.Name):
 		genesis = core.DefaultBaklavaGenesisBlock()
 	case ctx.GlobalBool(AlfajoresFlag.Name):

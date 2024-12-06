@@ -122,7 +122,7 @@ type core struct {
 	roundChangeTimer   *time.Timer
 	roundChangeTimerMu sync.RWMutex
 
-	validateFn func([]byte, []byte) (common.Address, error)
+	validateFn istanbul.ValidateFn
 
 	backlog MsgBacklog
 
@@ -131,7 +131,7 @@ type core struct {
 	currentMu sync.RWMutex
 	handlerWg *sync.WaitGroup
 
-	roundChangeSet *roundChangeSet
+	roundChangeSetV2 *roundChangeSetV2
 
 	pendingRequests   *prque.Prque
 	pendingRequestsMu *sync.Mutex
@@ -151,10 +151,6 @@ type core struct {
 
 // New creates an Istanbul consensus core
 func New(backend CoreBackend, config *istanbul.Config) Engine {
-	rsdb, err := newRoundStateDB(config.RoundStateDBPath, nil)
-	if err != nil {
-		log.Crit("Failed to open RoundStateDB", "err", err)
-	}
 
 	c := &core{
 		config:                    config,
@@ -166,7 +162,6 @@ func New(backend CoreBackend, config *istanbul.Config) Engine {
 		pendingRequests:           prque.New(nil),
 		pendingRequestsMu:         new(sync.Mutex),
 		consensusTimestamp:        time.Time{},
-		rsdb:                      rsdb,
 		consensusPrepareTimeGauge: metrics.NewRegisteredGauge("consensus/istanbul/core/consensus_prepare", nil),
 		consensusCommitTimeGauge:  metrics.NewRegisteredGauge("consensus/istanbul/core/consensus_commit", nil),
 		verifyGauge:               metrics.NewRegisteredGauge("consensus/istanbul/core/verify", nil),
@@ -332,6 +327,35 @@ func (c *core) finalizeMessage(msg *istanbul.Message) ([]byte, error) {
 	return payload, nil
 }
 
+// gossip broadcasts an already existing & signed message.
+func (c *core) gossip(msg *istanbul.Message) {
+	c.gossipTo(msg, istanbul.MapValidatorsToAddresses(c.current.ValidatorSet().List()))
+}
+
+// gossipTo broadcasts an already existing & signed message to the specified addresses.
+func (c *core) gossipTo(msg *istanbul.Message, addresses []common.Address) {
+	logger := c.newLogger("func", "gossipTo")
+
+	if len(msg.Signature) == 0 {
+		// should use broadcast() instead
+		logger.Error("Tried to gossip unsigned istanbul message", "m", msg)
+		return
+	}
+	logger.Trace("Gossipping message", "msg.Address", msg.Address.Hex(), "msg.Code", msg.Code)
+	// Convert to payload
+	payload, err := msg.Payload()
+	if err != nil {
+		logger.Error("Failed to convert message to payload", "m", msg, "err", err)
+		return
+	}
+
+	// Send payload to the specified addresses
+	if err := c.backend.Multicast(addresses, payload, istanbul.ConsensusMsg, true); err != nil {
+		logger.Error("Failed to send message", "m", msg, "err", err)
+		return
+	}
+}
+
 // Send message to all current validators
 func (c *core) broadcast(msg *istanbul.Message) {
 	c.sendMsgTo(msg, istanbul.MapValidatorsToAddresses(c.current.ValidatorSet().List()))
@@ -432,44 +456,48 @@ func GetAggregatedEpochValidatorSetSeal(blockNumber, epoch uint64, seals Message
 	return types.IstanbulEpochValidatorSetSeal{Bitmap: bitmap, Signature: asig}, nil
 }
 
-// Generates the next preprepare request and associated round change certificate
-func (c *core) getPreprepareWithRoundChangeCertificate(round *big.Int) (*istanbul.Request, istanbul.RoundChangeCertificate, error) {
+// getPreprepareWithRoundChangeCertificateV2 Generates the next preprepare request and associated round change certificate
+func (c *core) getPreprepareWithRoundChangeCertificateV2(round *big.Int) (*istanbul.Request, istanbul.RoundChangeCertificateV2, error) {
 	logger := c.newLogger("func", "getPreprepareWithRoundChangeCertificate", "for_round", round)
 
-	roundChangeCertificate, err := c.roundChangeSet.getCertificate(round, c.current.ValidatorSet().MinQuorumSize())
+	roundChangeCertificateV2, proposals, err := c.roundChangeSetV2.getCertificate(round, c.current.ValidatorSet().MinQuorumSize())
 	if err != nil {
-		return &istanbul.Request{}, istanbul.RoundChangeCertificate{}, err
+		return &istanbul.Request{}, istanbul.RoundChangeCertificateV2{}, err
 	}
+	// Do View verification
+	for _, req := range roundChangeCertificateV2.Requests {
+		if !req.HasPreparedCertificate() {
+			continue
+		}
+
+		_, err := c.getViewFromVerifiedPreparedCertificateV2(req.PreparedCertificateV2)
+		if err != nil {
+			logger.Error("Unexpected: could not verify a previously received PreparedCertificate round change request", "src_m", req)
+			return &istanbul.Request{}, istanbul.RoundChangeCertificateV2{}, err
+		}
+	}
+
 	// Start with pending request
 	request := c.current.PendingRequest()
 	// Search for a valid request in round change messages.
 	// The proposal must come from the prepared certificate with the highest round number.
 	// All prepared certificates from the same round are assumed to be the same proposal or no proposal (guaranteed by quorum intersection)
-	maxRound := big.NewInt(-1)
-	for _, message := range roundChangeCertificate.RoundChangeMessages {
-		roundChange := message.RoundChange()
-		if !roundChange.HasPreparedCertificate() {
-			continue
-		}
-
-		preparedCertificateView, err := c.getViewFromVerifiedPreparedCertificate(roundChange.PreparedCertificate)
-		if err != nil {
-			logger.Error("Unexpected: could not verify a previously received PreparedCertificate message", "src_m", message)
-			return &istanbul.Request{}, istanbul.RoundChangeCertificate{}, err
-		}
-
-		if preparedCertificateView != nil && preparedCertificateView.Round.Cmp(maxRound) > 0 {
-			maxRound = preparedCertificateView.Round
-			request = &istanbul.Request{
-				Proposal: roundChange.PreparedCertificate.Proposal,
-			}
-		}
+	maxPC := roundChangeCertificateV2.AnyHighestPreparedCertificate()
+	if maxPC == nil {
+		return request, roundChangeCertificateV2, nil
 	}
-	return request, roundChangeCertificate, nil
+	if proposal, ok := proposals[maxPC.ProposalHash]; ok {
+		return &istanbul.Request{
+			Proposal: proposal,
+		}, roundChangeCertificateV2, nil
+	} else {
+		logger.Error("Proposal not found from roundChangeSetV2.getCertificate")
+	}
+	return request, roundChangeCertificateV2, nil
 }
 
 // startNewRound starts a new round with the desired round
-func (c *core) startNewRound(round *big.Int) error {
+func (c *core) startNewRound(round *big.Int, propose bool) error {
 	logger := c.newLogger("func", "startNewRound", "tag", "stateTransition")
 
 	if round.Cmp(c.current.Round()) == 0 {
@@ -486,19 +514,36 @@ func (c *core) startNewRound(round *big.Int) error {
 		Round:    new(big.Int).Set(round),
 	}
 
-	var err error
-	request, roundChangeCertificate, err := c.getPreprepareWithRoundChangeCertificate(round)
-	if err != nil {
-		logger.Error("Unable to produce round change certificate", "err", err, "new_round", round)
-		return nil
-	}
-
 	// Calculate new proposer
 	prevProposer := c.current.Proposer()
 	prevBlock := c.current.Sequence().Uint64() - 1
 	blockAuthor := c.backend.AuthorForBlock(prevBlock)
 	valSet := c.current.ValidatorSet()
 	nextProposer := c.selectProposer(valSet, blockAuthor, newView.Round.Uint64())
+
+	var err error
+	var request *istanbul.Request
+	var roundChangeCertificateV2 istanbul.RoundChangeCertificateV2
+
+	//	startNewRound is called from two different places: handleRoundChange and handleRoundChangeCertificate.
+	//	The first occurs when receiving a RoundChange(V1 or V2) message, and the second when receiving a Preprepare(V1 or V2) message (round >= 1).
+
+	//	In the second case, during a preprepare handling, this function is creating a preprepare and a
+	//	roundchangecertificate with the round change messages that it received in the roundchangecertificate; This generated RCC
+	//	won't be used.
+
+	//	With the V2 istanbul version of the RoundChangeCertificate, the round change messages may not be available,
+	//	therefore it is not possible to create the RCC_V2 by using the same RoundChangeSet
+	//	The solution was to modify completely how the roundChangeSet works,
+	//	but since the co-existence of V1 and V2 are temporary, the propose flag should be enough.
+	//  If necessary, removal of this flag should be done after successfully removing al v1 code.
+	if c.address == nextProposer.Address() && propose {
+		request, roundChangeCertificateV2, err = c.getPreprepareWithRoundChangeCertificateV2(round)
+		if err != nil {
+			logger.Error("Unable to produce round change certificate v2", "err", err, "new_round", round)
+			return nil
+		}
+	}
 
 	// Update the roundstate db
 	c.current.StartNewRound(round, valSet, nextProposer)
@@ -508,7 +553,7 @@ func (c *core) startNewRound(round *big.Int) error {
 	c.backlog.updateState(c.current.View(), c.current.State())
 
 	if c.isProposer() && request != nil {
-		c.sendPreprepare(request, roundChangeCertificate)
+		c.sendPreprepareV2(request, roundChangeCertificateV2)
 	}
 	c.resetRoundChangeTimer()
 
@@ -528,7 +573,7 @@ func (c *core) startNewSequence() error {
 	if headBlock.Number().Cmp(c.current.Sequence()) == 0 {
 		logger.Trace("Moving to the next block")
 	} else if headBlock.Number().Cmp(c.current.Sequence()) > 0 {
-		logger.Trace("Catching up the the head block")
+		logger.Trace("Catching up the head block")
 	} else {
 		logger.Warn("New sequence should be larger than current sequence")
 		// TODO(Joshua): figure out if we need to wait for the next block to be mined here
@@ -542,7 +587,7 @@ func (c *core) startNewSequence() error {
 		Round:    new(big.Int).Set(common.Big0),
 	}
 	valSet := c.backend.Validators(headBlock)
-	c.roundChangeSet = newRoundChangeSet(valSet)
+	c.roundChangeSetV2 = newRoundChangeSetV2(valSet)
 
 	// Inform the backend that a new sequence has started & bail if the backed stopped the core
 	if primary := c.backend.IsPrimaryForSeq(newView.Sequence); !primary {
@@ -581,7 +626,7 @@ func (c *core) startNewSequence() error {
 func (c *core) waitForDesiredRound(r *big.Int) error {
 	logger := c.newLogger("func", "waitForDesiredRound", "new_desired_round", r)
 
-	// Don't wait for an older round
+	// Don't wait for an older or equal round
 	if c.current.DesiredRound().Cmp(r) >= 0 {
 		logger.Trace("New desired round not greater than current desired round")
 		return nil
@@ -667,7 +712,6 @@ func (c *core) resetRoundState(view *istanbul.View, validatorSet istanbul.Valida
 		newParentCommits = newMessageSet(c.backend.ParentBlockValidators(headBlock))
 	}
 	return c.current.StartNewSequence(view.Sequence, validatorSet, nextProposer, newParentCommits)
-
 }
 
 func (c *core) isProposer() bool {

@@ -158,14 +158,14 @@ func (l *Log) Data(ctx context.Context) hexutil.Bytes {
 // AccessTuple represents EIP-2930
 type AccessTuple struct {
 	address     common.Address
-	storageKeys *[]common.Hash
+	storageKeys []common.Hash
 }
 
 func (at *AccessTuple) Address(ctx context.Context) common.Address {
 	return at.address
 }
 
-func (at *AccessTuple) StorageKeys(ctx context.Context) *[]common.Hash {
+func (at *AccessTuple) StorageKeys(ctx context.Context) []common.Hash {
 	return at.storageKeys
 }
 
@@ -228,9 +228,9 @@ func (t *Transaction) GasPrice(ctx context.Context) (hexutil.Big, error) {
 	switch tx.Type() {
 	case types.AccessListTxType:
 		return hexutil.Big(*tx.GasPrice()), nil
-	case types.DynamicFeeTxType:
+	case types.DynamicFeeTxType, types.CeloDynamicFeeTxType, types.CeloDynamicFeeTxV2Type, types.CeloDenominatedTxType:
 		if t.block != nil {
-			if baseFee, _ := t.block.BaseFeePerGas(ctx); baseFee != nil {
+			if baseFee, _ := t.block.BaseFeePerGasForCurrency(ctx, tx.DenominatedFeeCurrency()); baseFee != nil {
 				// price = min(tip, gasFeeCap - baseFee) + baseFee
 				return (hexutil.Big)(*math.BigMin(new(big.Int).Add(tx.GasTipCap(), baseFee.ToInt()), tx.GasFeeCap())), nil
 			}
@@ -246,16 +246,16 @@ func (t *Transaction) EffectiveGasPrice(ctx context.Context) (*hexutil.Big, erro
 	if err != nil || tx == nil {
 		return nil, err
 	}
-	header, err := t.block.resolveHeader(ctx)
-	if err != nil || header == nil {
-		return nil, err
+	switch tx.Type() {
+	case types.DynamicFeeTxType, types.CeloDynamicFeeTxType, types.CeloDynamicFeeTxV2Type, types.CeloDenominatedTxType:
+		if t.block != nil {
+			if baseFee, _ := t.block.BaseFeePerGasForCurrency(ctx, tx.DenominatedFeeCurrency()); baseFee != nil {
+				// price = min(tip, gasFeeCap - baseFee) + baseFee
+				return (*hexutil.Big)(math.BigMin(new(big.Int).Add(tx.GasTipCap(), baseFee.ToInt()), tx.GasFeeCap())), nil
+			}
+		}
 	}
-	return (*hexutil.Big)(tx.GasPrice()), nil
-	// TODO: Substitute GPM
-	// if header.BaseFee == nil {
-	// 	return (*hexutil.Big)(tx.GasPrice()), nil
-	// }
-	// return (*hexutil.Big)(math.BigMin(new(big.Int).Add(tx.GasTipCap(), header.BaseFee), tx.GasFeeCap())), nil
+	return nil, nil
 }
 
 func (t *Transaction) MaxFeePerGas(ctx context.Context) (*hexutil.Big, error) {
@@ -444,7 +444,7 @@ func (t *Transaction) AccessList(ctx context.Context) (*[]*AccessTuple, error) {
 	for _, al := range accessList {
 		ret = append(ret, &AccessTuple{
 			address:     al.Address,
-			storageKeys: &al.StorageKeys,
+			storageKeys: al.StorageKeys,
 		})
 	}
 	return &ret, nil
@@ -579,18 +579,23 @@ func (b *Block) GasUsed(ctx context.Context) (Long, error) {
 	return Long(header.GasUsed), nil
 }
 
-// TODO: Enable GasLimit graphQL interface
-
 func (b *Block) BaseFeePerGas(ctx context.Context) (*hexutil.Big, error) {
-	// header, err := b.resolveHeader(ctx)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// if header.BaseFee == nil {
-	// 	return nil, nil
-	// }
-	// return (*hexutil.Big)(header.BaseFee), nil
-	return nil, nil
+	// To have an external API as compatible to geth as possible, we return the
+	// base for celo gold, here. We can add a separate variable for the base
+	// fees for each currency.
+	return b.BaseFeePerGasForCurrency(ctx, nil)
+}
+
+func (b *Block) BaseFeePerGasForCurrency(ctx context.Context, feeCurrency *common.Address) (*hexutil.Big, error) {
+	header, err := b.resolveHeader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	baseFee, err := b.backend.GasPriceMinimumForHeader(ctx, feeCurrency, header)
+	if err != nil {
+		return nil, err
+	}
+	return (*hexutil.Big)(baseFee), nil
 }
 
 func (b *Block) Parent(ctx context.Context) (*Block, error) {
@@ -875,7 +880,7 @@ func (b *Block) Call(ctx context.Context, args struct {
 			return nil, err
 		}
 	}
-	result, err := ethapi.DoCall(ctx, b.backend, args.Data, *b.numberOrHash, nil, 5*time.Second, b.backend.RPCGasCap())
+	result, err := ethapi.DoCall(ctx, b.backend, args.Data, *b.numberOrHash, nil, 5*time.Second, b.backend.RPCGasCap(), false)
 	if err != nil {
 		return nil, err
 	}
@@ -945,7 +950,7 @@ func (p *Pending) Call(ctx context.Context, args struct {
 	Data ethapi.TransactionArgs
 }) (*CallResult, error) {
 	pendingBlockNr := rpc.BlockNumberOrHashWithNumber(rpc.PendingBlockNumber)
-	result, err := ethapi.DoCall(ctx, p.backend, args.Data, pendingBlockNr, nil, 5*time.Second, p.backend.RPCGasCap())
+	result, err := ethapi.DoCall(ctx, p.backend, args.Data, pendingBlockNr, nil, 5*time.Second, p.backend.RPCGasCap(), false)
 	if err != nil {
 		return nil, err
 	}
@@ -1172,7 +1177,7 @@ func (s *SyncState) KnownStates() *hexutil.Uint64 {
 // - pulledStates:  number of state entries processed until now
 // - knownStates:   number of known state entries that still need to be pulled
 func (r *Resolver) Syncing() (*SyncState, error) {
-	progress := r.backend.Downloader().Progress()
+	progress := r.backend.SyncProgress()
 
 	// Return not syncing if the synchronisation already completed
 	if progress.CurrentBlock >= progress.HighestBlock {
