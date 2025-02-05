@@ -50,10 +50,12 @@ var (
 
 // Transaction types.
 const (
-	LegacyTxType         = iota
-	AccessListTxType     = 0x01
-	DynamicFeeTxType     = 0x02
-	CeloDynamicFeeTxType = 0x7c // Counting down
+	LegacyTxType           = iota
+	AccessListTxType       = 0x01
+	DynamicFeeTxType       = 0x02
+	CeloDynamicFeeTxType   = 0x7c // Counting down
+	CeloDynamicFeeTxV2Type = 0x7b
+	CeloDenominatedTxType  = 0x7a
 )
 
 // Transaction is an Ethereum transaction.
@@ -92,15 +94,16 @@ type TxData interface {
 	nonce() uint64
 	to() *common.Address
 
+	rawSignatureValues() (v, r, s *big.Int)
+	setSignatureValues(chainID, v, r, s *big.Int)
+
 	// Celo specific fields
 	feeCurrency() *common.Address
 	gatewayFeeRecipient() *common.Address
 	gatewayFee() *big.Int
-	// Whether this is an ethereum-compatible transaction (i.e. with FeeCurrency, GatewayFeeRecipient and GatewayFee omitted)
+	// Whether this is an ethereum-compatible transaction (i.e. with FeeCurrency, MaxFeeInFeeCurrency, GatewayFeeRecipient and GatewayFee omitted)
 	ethCompatible() bool
-
-	rawSignatureValues() (v, r, s *big.Int)
-	setSignatureValues(chainID, v, r, s *big.Int)
+	maxFeeInFeeCurrency() *big.Int
 }
 
 // EncodeRLP implements rlp.Encoder
@@ -207,6 +210,14 @@ func (tx *Transaction) decodeTyped(b []byte) (TxData, error) {
 		var inner CeloDynamicFeeTx
 		err := rlp.DecodeBytes(b[1:], &inner)
 		return &inner, err
+	case CeloDynamicFeeTxV2Type:
+		var inner CeloDynamicFeeTxV2
+		err := rlp.DecodeBytes(b[1:], &inner)
+		return &inner, err
+	case CeloDenominatedTxType:
+		var inner CeloDenominatedTx
+		err := rlp.DecodeBytes(b[1:], &inner)
+		return &inner, err
 	default:
 		return nil, ErrTxTypeNotSupported
 	}
@@ -278,36 +289,6 @@ func (tx *Transaction) ChainId() *big.Int {
 	return tx.inner.chainID()
 }
 
-// FeeCurrency returns the fee currency of the transaction. Nil implies paying in CELO.
-func (tx *Transaction) FeeCurrency() *common.Address { return tx.inner.feeCurrency() }
-
-// GatewayFeeRecipient returns the address to the send the gateway fee to. Nil implies no recipient.
-func (tx *Transaction) GatewayFeeRecipient() *common.Address { return tx.inner.gatewayFeeRecipient() }
-
-// GatewayFee returns the fee that should be paid to the gateway fee recipient.
-// Will not return nil, but instead returns 0 if the underlying transction does not have a gatewayfee.
-func (tx *Transaction) GatewayFee() *big.Int {
-	if tx.inner.gatewayFee() != nil {
-		return new(big.Int).Set(tx.inner.gatewayFee())
-	} else {
-		return big.NewInt(0)
-	}
-}
-
-// EthCompatible returns true iff the RLP form of the LegacyTx does not have the celo specific fields.
-func (tx *Transaction) EthCompatible() bool { return tx.inner.ethCompatible() }
-
-// Fee calculates the fess paid by the transaction include the gateway fee.
-func (tx *Transaction) Fee() *big.Int {
-	return Fee(tx.inner.gasPrice(), tx.inner.gas(), tx.GatewayFee())
-}
-
-// Fee calculates the transaction fee (gasLimit * gasPrice + gatewayFee)
-func Fee(gasPrice *big.Int, gasLimit uint64, gatewayFee *big.Int) *big.Int {
-	gasFee := new(big.Int).Mul(gasPrice, big.NewInt(int64(gasLimit)))
-	return gasFee.Add(gasFee, gatewayFee)
-}
-
 // Data returns the input data of the transaction.
 func (tx *Transaction) Data() []byte { return tx.inner.data() }
 
@@ -335,13 +316,7 @@ func (tx *Transaction) Nonce() uint64 { return tx.inner.nonce() }
 // To returns the recipient address of the transaction.
 // For contract-creation transactions, To returns nil.
 func (tx *Transaction) To() *common.Address {
-	// Copy the pointed-to address.
-	ito := tx.inner.to()
-	if ito == nil {
-		return nil
-	}
-	cpy := *ito
-	return &cpy
+	return copyAddressPtr(tx.inner.to())
 }
 
 // Cost returns value + gasprice * gaslimit + gatewayfee.
@@ -471,14 +446,6 @@ func (tx *Transaction) Size() common.StorageSize {
 	return common.StorageSize(c)
 }
 
-// CheckEthCompatibility checks that the Celo-only fields are nil-or-0 if EthCompatible is true
-func (tx *Transaction) CheckEthCompatibility() error {
-	if tx.EthCompatible() && !(tx.FeeCurrency() == nil && tx.GatewayFeeRecipient() == nil && tx.GatewayFee().Sign() == 0) {
-		return ErrEthCompatibleTransactionIsntCompatible
-	}
-	return nil
-}
-
 // WithSignature returns a new transaction with the given signature.
 // This signature needs to be in the [R || S || V] format where V is 0 or 1.
 func (tx *Transaction) WithSignature(signer Signer, sig []byte) (*Transaction, error) {
@@ -489,6 +456,68 @@ func (tx *Transaction) WithSignature(signer Signer, sig []byte) (*Transaction, e
 	cpy := tx.inner.copy()
 	cpy.setSignatureValues(signer.ChainID(), v, r, s)
 	return &Transaction{inner: cpy, time: tx.time}, nil
+}
+
+// FeeCurrency returns the fee currency of the transaction. Nil implies paying in CELO.
+func (tx *Transaction) FeeCurrency() *common.Address {
+	return copyAddressPtr(tx.inner.feeCurrency())
+}
+
+// GatewayFeeRecipient returns the address to the send the gateway fee to. Nil implies no recipient.
+func (tx *Transaction) GatewayFeeRecipient() *common.Address {
+	return copyAddressPtr(tx.inner.gatewayFeeRecipient())
+}
+
+// GatewayFee returns the fee that should be paid to the gateway fee recipient.
+// Will not return nil, but instead returns 0 if the underlying transction does not have a gatewayfee.
+func (tx *Transaction) GatewayFee() *big.Int {
+	if tx.inner.gatewayFee() != nil {
+		return new(big.Int).Set(tx.inner.gatewayFee())
+	} else {
+		return big.NewInt(0)
+	}
+}
+
+// GatewaySet returns true if the gatewayFeeRecipient or the gatewayFee are set.
+func (tx *Transaction) GatewaySet() bool {
+	return tx.inner.gatewayFeeRecipient() != nil || (tx.inner.gatewayFee() != nil && tx.inner.gatewayFee().Sign() != 0)
+}
+
+// EthCompatible returns true iff the RLP form of the LegacyTx does not have the celo specific fields.
+func (tx *Transaction) EthCompatible() bool { return tx.inner.ethCompatible() }
+
+// MaxFeeInFeeCurrency returns the max fee in the fee_currency for celo denominated txs.
+func (tx *Transaction) MaxFeeInFeeCurrency() *big.Int { return tx.inner.maxFeeInFeeCurrency() }
+
+// Fee calculates the fess paid by the transaction include the gateway fee.
+func (tx *Transaction) Fee() *big.Int {
+	return Fee(tx.inner.gasPrice(), tx.inner.gas(), tx.GatewayFee())
+}
+
+// Fee calculates the transaction fee (gasLimit * gasPrice + gatewayFee)
+func Fee(gasPrice *big.Int, gasLimit uint64, gatewayFee *big.Int) *big.Int {
+	gasFee := new(big.Int).Mul(gasPrice, big.NewInt(int64(gasLimit)))
+	return gasFee.Add(gasFee, gatewayFee)
+}
+
+// CheckEthCompatibility checks that the Celo-only fields are nil-or-0 if EthCompatible is true
+func (tx *Transaction) CheckEthCompatibility() error {
+	if tx.EthCompatible() &&
+		!(tx.FeeCurrency() == nil && tx.GatewayFeeRecipient() == nil && tx.GatewayFee().Sign() == 0 && tx.MaxFeeInFeeCurrency() == nil) {
+		return ErrEthCompatibleTransactionIsntCompatible
+	}
+	return nil
+}
+
+// DenominatedFeeCurrency returns in which currency the fields GasPrice, GasTipCap, GasFeeCap, etc are
+// denominated in
+func (tx *Transaction) DenominatedFeeCurrency() *common.Address {
+	// not declaring this method in TxData since it's a specific for just one type,
+	// to avoid cluttering it with more methods.
+	if tx.Type() == CeloDenominatedTxType {
+		return nil
+	}
+	return tx.FeeCurrency()
 }
 
 // Transactions implements DerivableList for transactions.
@@ -541,18 +570,24 @@ type TxWithMinerFee struct {
 	tx       *Transaction
 	minerFee *big.Int // in CELO
 }
+type ToCELOFn func(amount *big.Int, feeCurrency *common.Address) (*big.Int, error)
 
 // NewTxWithMinerFee creates a wrapped transaction, calculating the effective
 // miner gasTipCap if a base fee is provided. The MinerFee is converted to CELO.
 // Returns error in case of a negative effective miner gasTipCap.
-func NewTxWithMinerFee(tx *Transaction, baseFeeFn func(feeCurrency *common.Address) *big.Int, toCELO func(amount *big.Int, feeCurrency *common.Address) *big.Int) (*TxWithMinerFee, error) {
+func NewTxWithMinerFee(tx *Transaction, baseFeeFn func(feeCurrency *common.Address) *big.Int, toCELO ToCELOFn) (*TxWithMinerFee, error) {
 	minerFee, err := tx.EffectiveGasTip(baseFeeFn(tx.FeeCurrency()))
 	if err != nil {
 		return nil, err
 	}
+	minerFeeInCelo, err := toCELO(minerFee, tx.FeeCurrency())
+	if err != nil {
+		log.Error("NewTxWithMinerFee: Could not convert fees for tx", "tx", tx, "err", err)
+		return nil, err
+	}
 	return &TxWithMinerFee{
 		tx:       tx,
-		minerFee: toCELO(minerFee, tx.FeeCurrency()),
+		minerFee: minerFeeInCelo,
 	}, nil
 }
 
@@ -588,11 +623,11 @@ func (s *TxByPriceAndTime) Pop() interface{} {
 // transactions in a profit-maximizing sorted order, while supporting removing
 // entire batches of transactions for non-executable accounts.
 type TransactionsByPriceAndNonce struct {
-	txs       map[common.Address]Transactions                             // Per account nonce-sorted list of transactions
-	heads     TxByPriceAndTime                                            // Next transaction for each unique account (price heap)
-	signer    Signer                                                      // Signer for the set of transactions
-	baseFeeFn func(feeCurrency *common.Address) *big.Int                  // Function to get the basefee for the specified feecurrency.
-	toCELO    func(amount *big.Int, feeCurrency *common.Address) *big.Int // Current exchange rate to CELO
+	txs       map[common.Address]Transactions            // Per account nonce-sorted list of transactions
+	heads     TxByPriceAndTime                           // Next transaction for each unique account (price heap)
+	signer    Signer                                     // Signer for the set of transactions
+	baseFeeFn func(feeCurrency *common.Address) *big.Int // Function to get the basefee for the specified feecurrency.
+	toCELO    ToCELOFn                                   // Current exchange rate to CELO
 }
 
 // NewTransactionsByPriceAndNonce creates a transaction set that can retrieve
@@ -601,7 +636,7 @@ type TransactionsByPriceAndNonce struct {
 // Note, the input map is reowned so the caller should not interact any more with
 // if after providing it to the constructor.
 // Note: txCmpFunc should handle the basefee
-func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transactions, baseFeeFn func(feeCurrency *common.Address) *big.Int, toCELO func(amount *big.Int, feeCurrency *common.Address) *big.Int) *TransactionsByPriceAndNonce {
+func NewTransactionsByPriceAndNonce(signer Signer, txs map[common.Address]Transactions, baseFeeFn func(feeCurrency *common.Address) *big.Int, toCELO ToCELOFn) *TransactionsByPriceAndNonce {
 	// Initialize a price and received time based heap with the head transactions
 	heads := make(TxByPriceAndTime, 0, len(txs))
 	for from, accTxs := range txs {
@@ -668,34 +703,38 @@ type Message struct {
 	gasFeeCap           *big.Int
 	gasTipCap           *big.Int
 	feeCurrency         *common.Address
+	maxFeeInFeeCurrency *big.Int
 	gatewayFeeRecipient *common.Address
 	gatewayFee          *big.Int
 	data                []byte
 	accessList          AccessList
 	ethCompatible       bool
-	checkNonce          bool
+	isFake              bool
 }
 
 func NewMessage(from common.Address, to *common.Address, nonce uint64, amount *big.Int,
 	gasLimit uint64, gasPrice, gasFeeCap, gasTipCap *big.Int,
-	feeCurrency, gatewayFeeRecipient *common.Address, gatewayFee *big.Int,
-	data []byte, accessList AccessList, ethCompatible, checkNonce bool) Message {
+	feeCurrency *common.Address, maxFeeInFeeCurrency *big.Int, gatewayFeeRecipient *common.Address, gatewayFee *big.Int,
+	data []byte, accessList AccessList, ethCompatible, isFake bool) Message {
 	m := Message{
-		from:                from,
-		to:                  to,
-		nonce:               nonce,
-		amount:              amount,
-		gasLimit:            gasLimit,
-		gasPrice:            gasPrice,
-		gasFeeCap:           gasFeeCap,
-		gasTipCap:           gasTipCap,
+		from:       from,
+		to:         to,
+		nonce:      nonce,
+		amount:     amount,
+		gasLimit:   gasLimit,
+		gasPrice:   gasPrice,
+		gasFeeCap:  gasFeeCap,
+		gasTipCap:  gasTipCap,
+		data:       data,
+		accessList: accessList,
+		isFake:     isFake,
+
+		// Celo specific fields
 		feeCurrency:         feeCurrency,
+		maxFeeInFeeCurrency: maxFeeInFeeCurrency,
 		gatewayFeeRecipient: gatewayFeeRecipient,
 		gatewayFee:          gatewayFee,
-		data:                data,
-		accessList:          accessList,
 		ethCompatible:       ethCompatible,
-		checkNonce:          checkNonce,
 	}
 	if m.gatewayFee == nil {
 		m.gatewayFee = new(big.Int)
@@ -706,19 +745,22 @@ func NewMessage(from common.Address, to *common.Address, nonce uint64, amount *b
 // AsMessage returns the transaction as a core.Message.
 func (tx *Transaction) AsMessage(s Signer, baseFee *big.Int) (Message, error) {
 	msg := Message{
-		nonce:               tx.Nonce(),
-		gasLimit:            tx.Gas(),
-		gasPrice:            new(big.Int).Set(tx.GasPrice()),
-		gasFeeCap:           new(big.Int).Set(tx.GasFeeCap()),
-		gasTipCap:           new(big.Int).Set(tx.GasTipCap()),
+		nonce:      tx.Nonce(),
+		gasLimit:   tx.Gas(),
+		gasPrice:   new(big.Int).Set(tx.GasPrice()),
+		gasFeeCap:  new(big.Int).Set(tx.GasFeeCap()),
+		gasTipCap:  new(big.Int).Set(tx.GasTipCap()),
+		to:         tx.To(),
+		amount:     tx.Value(),
+		data:       tx.Data(),
+		accessList: tx.AccessList(),
+		isFake:     false,
+
+		// Celo specific fields
 		feeCurrency:         tx.FeeCurrency(),
+		maxFeeInFeeCurrency: tx.MaxFeeInFeeCurrency(),
 		gatewayFeeRecipient: tx.GatewayFeeRecipient(),
 		gatewayFee:          new(big.Int),
-		to:                  tx.To(),
-		amount:              tx.Value(),
-		data:                tx.Data(),
-		accessList:          tx.AccessList(),
-		checkNonce:          true,
 		ethCompatible:       tx.EthCompatible(),
 	}
 	// If baseFee provided, set gasPrice to effectiveGasPrice.
@@ -733,23 +775,37 @@ func (tx *Transaction) AsMessage(s Signer, baseFee *big.Int) (Message, error) {
 	return msg, err
 }
 
-func (m Message) From() common.Address                 { return m.from }
-func (m Message) To() *common.Address                  { return m.to }
-func (m Message) GasPrice() *big.Int                   { return m.gasPrice }
-func (m Message) GasFeeCap() *big.Int                  { return m.gasFeeCap }
-func (m Message) GasTipCap() *big.Int                  { return m.gasTipCap }
-func (m Message) EthCompatible() bool                  { return m.ethCompatible }
-func (m Message) FeeCurrency() *common.Address         { return m.feeCurrency }
-func (m Message) GatewayFeeRecipient() *common.Address { return m.gatewayFeeRecipient }
-func (m Message) GatewayFee() *big.Int                 { return m.gatewayFee }
-func (m Message) Value() *big.Int                      { return m.amount }
-func (m Message) Gas() uint64                          { return m.gasLimit }
-func (m Message) Nonce() uint64                        { return m.nonce }
-func (m Message) Data() []byte                         { return m.data }
-func (m Message) AccessList() AccessList               { return m.accessList }
-func (m Message) CheckNonce() bool                     { return m.checkNonce }
+func (m Message) From() common.Address   { return m.from }
+func (m Message) To() *common.Address    { return m.to }
+func (m Message) GasPrice() *big.Int     { return m.gasPrice }
+func (m Message) GasFeeCap() *big.Int    { return m.gasFeeCap }
+func (m Message) GasTipCap() *big.Int    { return m.gasTipCap }
+func (m Message) Value() *big.Int        { return m.amount }
+func (m Message) Gas() uint64            { return m.gasLimit }
+func (m Message) Nonce() uint64          { return m.nonce }
+func (m Message) Data() []byte           { return m.data }
+func (m Message) AccessList() AccessList { return m.accessList }
+func (m Message) IsFake() bool           { return m.isFake }
 
 func (m Message) Fee() *big.Int {
 	gasFee := new(big.Int).Mul(m.gasPrice, big.NewInt(int64(m.gasLimit)))
 	return gasFee.Add(gasFee, m.gatewayFee)
+}
+
+func (m Message) EthCompatible() bool                  { return m.ethCompatible }
+func (m Message) FeeCurrency() *common.Address         { return m.feeCurrency }
+func (m Message) MaxFeeInFeeCurrency() *big.Int        { return m.maxFeeInFeeCurrency }
+func (m Message) GatewayFeeRecipient() *common.Address { return m.gatewayFeeRecipient }
+func (m Message) GatewayFee() *big.Int                 { return m.gatewayFee }
+func (m Message) GatewaySet() bool {
+	return m.gatewayFeeRecipient != nil || (m.gatewayFee != nil && m.gatewayFee.Sign() != 0)
+}
+
+// copyAddressPtr copies an address.
+func copyAddressPtr(a *common.Address) *common.Address {
+	if a == nil {
+		return nil
+	}
+	cpy := *a
+	return &cpy
 }

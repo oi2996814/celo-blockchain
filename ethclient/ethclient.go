@@ -331,6 +331,16 @@ func (ec *Client) TransactionReceipt(ctx context.Context, txHash common.Hash) (*
 	return r, err
 }
 
+// BlockReceipts returns the receipts of a given block number or hash
+func (ec *Client) BlockReceipts(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) ([]*types.Receipt, error) {
+	var r []*types.Receipt
+	err := ec.c.CallContext(ctx, &r, "eth_getBlockReceipts", blockNrOrHash)
+	if err == nil && r == nil {
+		return nil, ethereum.NotFound
+	}
+	return r, err
+}
+
 type rpcProgress struct {
 	StartingBlock hexutil.Uint64
 	CurrentBlock  hexutil.Uint64
@@ -536,7 +546,7 @@ func (ec *Client) SuggestGasPrice(ctx context.Context) (*big.Int, error) {
 	return (*big.Int)(&hex), nil
 }
 
-// SuggestGasPrice retrieves the currently suggested gas price to allow a timely
+// SuggestGasPriceInCurrency retrieves the currently suggested gas price to allow a timely
 // execution of a transaction.
 func (ec *Client) SuggestGasPriceInCurrency(ctx context.Context, feeCurrency *common.Address) (*big.Int, error) {
 	var hex hexutil.Big
@@ -551,6 +561,16 @@ func (ec *Client) SuggestGasPriceInCurrency(ctx context.Context, feeCurrency *co
 func (ec *Client) SuggestGasTipCap(ctx context.Context) (*big.Int, error) {
 	var hex hexutil.Big
 	if err := ec.c.CallContext(ctx, &hex, "eth_maxPriorityFeePerGas"); err != nil {
+		return nil, err
+	}
+	return (*big.Int)(&hex), nil
+}
+
+// SuggestGasTipCapInCurrency retrieves the currently suggested gas tip cap after 1559 to
+// allow a timely execution of a transaction.
+func (ec *Client) SuggestGasTipCapInCurrency(ctx context.Context, feeCurrency *common.Address) (*big.Int, error) {
+	var hex hexutil.Big
+	if err := ec.c.CallContext(ctx, &hex, "eth_maxPriorityFeePerGas", feeCurrency); err != nil {
 		return nil, err
 	}
 	return (*big.Int)(&hex), nil
@@ -608,6 +628,9 @@ func toCallArg(msg ethereum.CallMsg) interface{} {
 	}
 	if msg.GasPrice != nil {
 		arg["gasPrice"] = (*hexutil.Big)(msg.GasPrice)
+	}
+	if msg.FeeCurrency != nil {
+		arg["feeCurrency"] = msg.FeeCurrency
 	}
 	return arg
 }

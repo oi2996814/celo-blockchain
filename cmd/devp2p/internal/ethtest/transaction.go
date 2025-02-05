@@ -29,10 +29,10 @@ import (
 	"github.com/celo-org/celo-blockchain/params"
 )
 
-//var faucetAddr = common.HexToAddress("0x71562b71999873DB5b286dF957af199Ec94617F7")
+// var faucetAddr = common.HexToAddress("0x71562b71999873DB5b286dF957af199Ec94617F7")
 var faucetKey, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
 
-func (s *Suite) sendSuccessfulTxs(t *utesting.T, isEth66 bool) error {
+func (s *Suite) sendSuccessfulTxs(t *utesting.T, isCelo67 bool) error {
 	tests := []*types.Transaction{
 		getNextTxFromChain(s),
 		unknownTx(s),
@@ -48,15 +48,15 @@ func (s *Suite) sendSuccessfulTxs(t *utesting.T, isEth66 bool) error {
 			prevTx = tests[i-1]
 		}
 		// write tx to connection
-		if err := sendSuccessfulTx(s, tx, prevTx, isEth66); err != nil {
+		if err := sendSuccessfulTx(s, tx, prevTx, isCelo67); err != nil {
 			return fmt.Errorf("send successful tx test failed: %v", err)
 		}
 	}
 	return nil
 }
 
-func sendSuccessfulTx(s *Suite, tx *types.Transaction, prevTx *types.Transaction, isEth66 bool) error {
-	sendConn, recvConn, err := s.createSendAndRecvConns(isEth66)
+func sendSuccessfulTx(s *Suite, tx *types.Transaction, prevTx *types.Transaction, isCelo67 bool) error {
+	sendConn, recvConn, err := s.createSendAndRecvConns(isCelo67)
 	if err != nil {
 		return err
 	}
@@ -114,7 +114,7 @@ func sendSuccessfulTx(s *Suite, tx *types.Transaction, prevTx *types.Transaction
 	}
 }
 
-func (s *Suite) sendMaliciousTxs(t *utesting.T, isEth66 bool) error {
+func (s *Suite) sendMaliciousTxs(t *utesting.T, isCelo67 bool) error {
 	badTxs := []*types.Transaction{
 		getOldTxFromChain(s),
 		invalidNonceTx(s),
@@ -127,8 +127,8 @@ func (s *Suite) sendMaliciousTxs(t *utesting.T, isEth66 bool) error {
 		recvConn *Conn
 		err      error
 	)
-	if isEth66 {
-		recvConn, err = s.dial66()
+	if isCelo67 {
+		recvConn, err = s.dial67()
 	} else {
 		recvConn, err = s.dial()
 	}
@@ -141,7 +141,7 @@ func (s *Suite) sendMaliciousTxs(t *utesting.T, isEth66 bool) error {
 	}
 	for i, tx := range badTxs {
 		t.Logf("Testing malicious tx propagation: %v\n", i)
-		if err = sendMaliciousTx(s, tx, isEth66); err != nil {
+		if err = sendMaliciousTx(s, tx, isCelo67); err != nil {
 			return fmt.Errorf("malicious tx test failed:\ntx: %v\nerror: %v", tx, err)
 		}
 	}
@@ -149,14 +149,14 @@ func (s *Suite) sendMaliciousTxs(t *utesting.T, isEth66 bool) error {
 	return checkMaliciousTxPropagation(s, badTxs, recvConn)
 }
 
-func sendMaliciousTx(s *Suite, tx *types.Transaction, isEth66 bool) error {
+func sendMaliciousTx(s *Suite, tx *types.Transaction, isCelo67 bool) error {
 	// setup connection
 	var (
 		conn *Conn
 		err  error
 	)
-	if isEth66 {
-		conn, err = s.dial66()
+	if isCelo67 {
+		conn, err = s.dial67()
 	} else {
 		conn, err = s.dial()
 	}
@@ -300,7 +300,7 @@ func unknownTx(s *Suite) *types.Transaction {
 	if tx.To() != nil {
 		to = *tx.To()
 	}
-	txNew := types.NewTransaction(tx.Nonce()+1, to, tx.Value(), tx.Gas(), tx.GasPrice(), tx.FeeCurrency(), tx.GatewayFeeRecipient(), tx.GatewayFee(), tx.Data())
+	txNew := types.NewCeloTransaction(tx.Nonce()+1, to, tx.Value(), tx.Gas(), tx.GasPrice(), tx.FeeCurrency(), tx.GatewayFeeRecipient(), tx.GatewayFee(), tx.Data())
 	return signWithFaucet(s.chain.chainConfig, txNew)
 }
 
@@ -341,7 +341,7 @@ func generateTxs(s *Suite, numTxs int) (map[common.Hash]common.Hash, []*types.Tr
 
 func generateTx(chainConfig *params.ChainConfig, nonce uint64, gas uint64) *types.Transaction {
 	var to common.Address
-	tx := types.NewTransaction(nonce, to, big.NewInt(1), gas, big.NewInt(1), nil, nil, nil, []byte{})
+	tx := types.NewTransaction(nonce, to, big.NewInt(1), gas, big.NewInt(1), []byte{})
 	return signWithFaucet(chainConfig, tx)
 }
 
@@ -364,7 +364,7 @@ func invalidNonceTx(s *Suite) *types.Transaction {
 	if tx.To() != nil {
 		to = *tx.To()
 	}
-	txNew := types.NewTransaction(tx.Nonce()-2, to, tx.Value(), tx.Gas(), tx.GasPrice(), tx.FeeCurrency(), tx.GatewayFeeRecipient(), tx.GatewayFee(), tx.Data())
+	txNew := types.NewCeloTransaction(tx.Nonce()-2, to, tx.Value(), tx.Gas(), tx.GasPrice(), tx.FeeCurrency(), tx.GatewayFeeRecipient(), tx.GatewayFee(), tx.Data())
 	return signWithFaucet(s.chain.chainConfig, txNew)
 }
 
@@ -378,7 +378,7 @@ func hugeAmount(s *Suite) *types.Transaction {
 	if tx.To() != nil {
 		to = *tx.To()
 	}
-	txNew := types.NewTransaction(tx.Nonce(), to, amount, tx.Gas(), tx.GasPrice(), tx.FeeCurrency(), tx.GatewayFeeRecipient(), tx.GatewayFee(), tx.Data())
+	txNew := types.NewCeloTransaction(tx.Nonce(), to, amount, tx.Gas(), tx.GasPrice(), tx.FeeCurrency(), tx.GatewayFeeRecipient(), tx.GatewayFee(), tx.Data())
 	return signWithFaucet(s.chain.chainConfig, txNew)
 }
 
@@ -392,7 +392,7 @@ func hugeGasPrice(s *Suite) *types.Transaction {
 	if tx.To() != nil {
 		to = *tx.To()
 	}
-	txNew := types.NewTransaction(tx.Nonce(), to, tx.Value(), tx.Gas(), gasPrice, tx.FeeCurrency(), tx.GatewayFeeRecipient(), tx.GatewayFee(), tx.Data())
+	txNew := types.NewCeloTransaction(tx.Nonce(), to, tx.Value(), tx.Gas(), gasPrice, tx.FeeCurrency(), tx.GatewayFeeRecipient(), tx.GatewayFee(), tx.Data())
 	return signWithFaucet(s.chain.chainConfig, txNew)
 }
 
@@ -405,7 +405,7 @@ func hugeData(s *Suite) *types.Transaction {
 	if tx.To() != nil {
 		to = *tx.To()
 	}
-	txNew := types.NewTransaction(tx.Nonce(), to, tx.Value(), tx.Gas(), tx.GasPrice(), tx.FeeCurrency(), tx.GatewayFeeRecipient(), tx.GatewayFee(), largeBuffer(2))
+	txNew := types.NewCeloTransaction(tx.Nonce(), to, tx.Value(), tx.Gas(), tx.GasPrice(), tx.FeeCurrency(), tx.GatewayFeeRecipient(), tx.GatewayFee(), largeBuffer(2))
 	return signWithFaucet(s.chain.chainConfig, txNew)
 }
 

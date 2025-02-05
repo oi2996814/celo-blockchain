@@ -61,13 +61,13 @@ func TestRoundStateRLPEncoding(t *testing.T) {
 		assertEqualRoundState(t, rs, result)
 	})
 
-	t.Run("With a Preprepare", func(t *testing.T) {
+	t.Run("With a PreprepareV2", func(t *testing.T) {
 		rs := dummyRoundState()
 
-		rs.TransitionToPreprepared(&istanbul.Preprepare{
-			Proposal:               makeBlock(1),
-			View:                   rs.View(),
-			RoundChangeCertificate: istanbul.RoundChangeCertificate{},
+		rs.TransitionToPrepreparedV2(&istanbul.PreprepareV2{
+			Proposal:                 makeBlock(1),
+			View:                     rs.View(),
+			RoundChangeCertificateV2: istanbul.RoundChangeCertificateV2{},
 		})
 
 		rawVal, err := rlp.EncodeToBytes(rs)
@@ -245,17 +245,17 @@ func TestRoundStateSummary(t *testing.T) {
 	t.Run("With a Preprepare", func(t *testing.T) {
 		rs := dummyRoundState()
 		block := makeBlock(1)
-		preprepare := &istanbul.Preprepare{
+		preprepare := &istanbul.PreprepareV2{
 			Proposal: block,
 			View:     rs.View(),
-			RoundChangeCertificate: istanbul.RoundChangeCertificate{
-				RoundChangeMessages: []istanbul.Message{
-					{Code: istanbul.MsgRoundChange, Address: validatorAddresses[3]},
+			RoundChangeCertificateV2: istanbul.RoundChangeCertificateV2{
+				Requests: []istanbul.RoundChangeRequest{
+					{Address: validatorAddresses[3]},
 				},
 			},
 		}
 
-		rs.TransitionToPreprepared(preprepare)
+		rs.TransitionToPrepreparedV2(preprepare)
 
 		rsSummary := rs.Summary()
 

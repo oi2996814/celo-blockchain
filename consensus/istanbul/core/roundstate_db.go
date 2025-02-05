@@ -19,6 +19,7 @@ package core
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"math/big"
 	"os"
 	"time"
@@ -26,12 +27,13 @@ import (
 	"github.com/celo-org/celo-blockchain/common"
 	"github.com/celo-org/celo-blockchain/common/task"
 	"github.com/celo-org/celo-blockchain/consensus/istanbul"
+	"github.com/celo-org/celo-blockchain/ethdb/leveldb"
 	"github.com/celo-org/celo-blockchain/log"
+	"github.com/celo-org/celo-blockchain/metrics"
 	"github.com/celo-org/celo-blockchain/rlp"
-	"github.com/syndtr/goleveldb/leveldb"
-	lvlerrors "github.com/syndtr/goleveldb/leveldb/errors"
+	goleveldb "github.com/syndtr/goleveldb/leveldb"
+
 	"github.com/syndtr/goleveldb/leveldb/opt"
-	"github.com/syndtr/goleveldb/leveldb/storage"
 	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
@@ -40,6 +42,7 @@ const (
 	dbVersionKey = "version"  // Version of the database to flush if changes
 	lastViewKey  = "lastView" // Last View that we know of
 	rsKey        = "rs"       // Database Key Pefix for RoundState
+	rcvdKey      = "rcvd"     // Database Key Prefix for rcvd messages from the RoundState (split saving)
 )
 
 type RoundStateDB interface {
@@ -49,6 +52,7 @@ type RoundStateDB interface {
 	GetOldestValidView() (*istanbul.View, error)
 	GetRoundStateFor(view *istanbul.View) (RoundState, error)
 	UpdateLastRoundState(rs RoundState) error
+	UpdateLastRcvd(rs RoundState) error
 	Close() error
 }
 
@@ -60,10 +64,19 @@ type RoundStateDBOptions struct {
 }
 
 type roundStateDBImpl struct {
-	db                   *leveldb.DB
+	db *leveldb.Database
+
 	stopGarbageCollector task.StopFn
 	opts                 RoundStateDBOptions
-	logger               log.Logger
+
+	rsRLPMeter      metrics.Meter // Meter for measuring the size of rs RLP-encoded data
+	rsRLPEncTimer   metrics.Timer // Timer measuring time required for rs RLP encoding
+	rsDbSaveTimer   metrics.Timer // Timer measuring rs DB write latency
+	rcvdRLPMeter    metrics.Meter // Meter for measuring the size of received consensus messages (rcvd) RLP-encoded data
+	rcvdRLPEncTimer metrics.Timer // Timer measuring time required for received consensus messages to be RLP encoded
+	rcvdDbSaveTimer metrics.Timer // Timer measuring DB write latency for received consensus messages
+
+	logger log.Logger // Contextual logger tracking the database path
 }
 
 var defaultRoundStateDBOptions = RoundStateDBOptions{
@@ -90,13 +103,14 @@ func coerceOptions(opts *RoundStateDBOptions) RoundStateDBOptions {
 func newRoundStateDB(path string, opts *RoundStateDBOptions) (RoundStateDB, error) {
 	logger := log.New("func", "newRoundStateDB", "type", "roundStateDB", "rsdb_path", path)
 
+	namespace := "consensus/istanbul/roundstate/db/"
 	logger.Info("Open roundstate db")
-	var db *leveldb.DB
+	var db *leveldb.Database
 	var err error
 	if path == "" {
 		db, err = newMemoryDB()
 	} else {
-		db, err = newPersistentDB(path)
+		db, err = newPersistentDB(path, namespace)
 	}
 
 	if err != nil {
@@ -110,43 +124,51 @@ func newRoundStateDB(path string, opts *RoundStateDBOptions) (RoundStateDB, erro
 		logger: logger,
 	}
 
+	rsdb.rsRLPMeter = metrics.NewRegisteredMeter(namespace+"rs/rlp/encoding/size", nil)
+	rsdb.rsRLPEncTimer = metrics.NewRegisteredTimer(namespace+"rs/rlp/encoding/duration", nil)
+	rsdb.rsDbSaveTimer = metrics.NewRegisteredTimer(namespace+"rs/db/save/time", nil)
+	rsdb.rcvdRLPMeter = metrics.NewRegisteredMeter(namespace+"rcvd/rlp/encoding/size", nil)
+	rsdb.rcvdRLPEncTimer = metrics.NewRegisteredTimer(namespace+"rcvd/rlp/encoding/duration", nil)
+	rsdb.rcvdDbSaveTimer = metrics.NewRegisteredTimer(namespace+"rcvd/db/save/time", nil)
+
 	if rsdb.opts.withGarbageCollector {
-		rsdb.stopGarbageCollector = task.RunTaskRepeateadly(rsdb.garbageCollectEntries, rsdb.opts.garbageCollectorPeriod)
+		rsdb.stopGarbageCollector = task.RunTaskRepeateadly(rsdb.garbageCollectEntries, task.NewDefaultTicker(rsdb.opts.garbageCollectorPeriod))
 	}
 
 	return rsdb, nil
 }
 
 // newMemoryDB creates a new in-memory node database without a persistent backend.
-func newMemoryDB() (*leveldb.DB, error) {
-	db, err := leveldb.Open(storage.NewMemStorage(), nil)
-	if err != nil {
-		return nil, err
-	}
-	return db, nil
+func newMemoryDB() (*leveldb.Database, error) {
+	return leveldb.NewInMemory()
 }
 
 // newPersistentNodeDB creates/opens a leveldb backed persistent node database,
 // also flushing its contents in case of a version mismatch.
-func newPersistentDB(path string) (*leveldb.DB, error) {
-	opts := &opt.Options{OpenFilesCacheCapacity: 5}
-	db, err := leveldb.OpenFile(path, opts)
-	if _, iscorrupted := err.(*lvlerrors.ErrCorrupted); iscorrupted {
-		db, err = leveldb.RecoverFile(path, nil)
-	}
+func newPersistentDB(path string, namespace string) (*leveldb.Database, error) {
+	db, err := leveldb.NewCustom(path, namespace, func(options *opt.Options) {
+		// increasing default values by a factor of 32 to decrease the number of
+		// compactions and overall disk operations, making a trade-off between
+		// high I/O usage and higher memory requirements in favor of the latter
+		options.BlockSize = 128 * opt.KiB
+		options.BlockCacheCapacity = 256 * opt.MiB
+		options.WriteBuffer = 128 * opt.MiB
+	})
+
 	if err != nil {
 		return nil, err
 	}
+
 	// The nodes contained in the cache correspond to a certain protocol version.
 	// Flush all nodes if the version doesn't match.
 	currentVer := make([]byte, binary.MaxVarintLen64)
 	currentVer = currentVer[:binary.PutVarint(currentVer, int64(dbVersion))]
 
-	blob, err := db.Get([]byte(dbVersionKey), nil)
+	blob, err := db.Get([]byte(dbVersionKey))
 	switch err {
-	case leveldb.ErrNotFound:
+	case goleveldb.ErrNotFound:
 		// Version not found (i.e. empty cache), insert it
-		if err := db.Put([]byte(dbVersionKey), currentVer, nil); err != nil {
+		if err := db.Put([]byte(dbVersionKey), currentVer); err != nil {
 			db.Close()
 			return nil, err
 		}
@@ -158,10 +180,127 @@ func newPersistentDB(path string) (*leveldb.DB, error) {
 			if err = os.RemoveAll(path); err != nil {
 				return nil, err
 			}
-			return newPersistentDB(path)
+			return newPersistentDB(path, namespace)
 		}
 	}
 	return db, nil
+}
+
+type rcvd struct {
+	Prepares      MessageSet
+	Commits       MessageSet
+	ParentCommits MessageSet
+}
+
+type rcvdRLP struct {
+	Prep []byte
+	Comm []byte
+	Parc []byte
+}
+
+func (r *rcvd) ToRLP() (*rcvdRLP, error) {
+	serializedParentCommits, err := r.ParentCommits.Serialize()
+	if err != nil {
+		return nil, err
+	}
+	serializedPrepares, err := r.Prepares.Serialize()
+	if err != nil {
+		return nil, err
+	}
+	serializedCommits, err := r.Commits.Serialize()
+	if err != nil {
+		return nil, err
+	}
+	return &rcvdRLP{
+		Prep: serializedPrepares,
+		Comm: serializedCommits,
+		Parc: serializedParentCommits,
+	}, nil
+}
+
+func (r *rcvd) FromRLP(r2 *rcvdRLP) error {
+	var err error
+	r.Prepares, err = deserializeMessageSet(r2.Prep)
+	if err != nil {
+		return err
+	}
+	r.ParentCommits, err = deserializeMessageSet(r2.Parc)
+	if err != nil {
+		return err
+	}
+	r.Commits, err = deserializeMessageSet(r2.Comm)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *rcvdRLP) EncodeRLP(w io.Writer) error {
+	return rlp.Encode(w, []interface{}{r.Prep, r.Comm, r.Parc})
+}
+
+func (r *rcvdRLP) DecodeRLP(s *rlp.Stream) error {
+	var d struct {
+		Prepares      []byte
+		Commits       []byte
+		ParentCommits []byte
+	}
+	if err := s.Decode(&d); err != nil {
+		return err
+	}
+	r.Prep = d.Prepares
+	r.Comm = d.Commits
+	r.Parc = d.ParentCommits
+	return nil
+}
+
+func rcvdFromRoundState(rs RoundState) *rcvd {
+	r := rcvd{}
+	r.Prepares = rs.Prepares()
+	r.Commits = rs.Commits()
+	r.ParentCommits = rs.ParentCommits()
+	return &r
+}
+
+// UpdateLastRcvd will update to the db only the rcvd messages (prepares, commits, parentCommits).
+// this is used to hold signed messages as proof for possible future slashes.
+// While UpdateLastRoundState stores the messages as well, this is called from
+// consensus when a message is received and approved, where we need fast updates
+// to the db, and we want to avoid re-saving the block in these cases.
+//
+// Possible future improvements are to completely refactor the RoundState & Impl to
+// include a fine-grained journaling system.
+func (rsdb *roundStateDBImpl) UpdateLastRcvd(rs RoundState) error {
+	logger := rsdb.logger.New("func", "UpdateLastRcvd")
+	rcvdViewKey := rcvdView2Key(rs.View())
+
+	r := rcvdFromRoundState(rs)
+	rRLP, err := r.ToRLP()
+	if err != nil {
+		return err
+	}
+	// Encode and measure time
+	before := time.Now()
+	entryBytes, err := rlp.EncodeToBytes(&rRLP)
+	rsdb.rcvdRLPEncTimer.UpdateSince(before)
+
+	if err != nil {
+		logger.Error("Failed to save rcvd messages from roundState", "reason", "rlp encoding", "err", err)
+		return err
+	}
+
+	rsdb.rcvdRLPMeter.Mark(int64(len(entryBytes)))
+
+	before = time.Now()
+	batch := rsdb.db.NewBatch()
+	batch.Put(rcvdViewKey, entryBytes)
+	err = batch.Write()
+	if err != nil {
+		logger.Error("Failed to save rcvd messages from roundState", "reason", "levelDB write", "err", err, "func")
+	}
+	rsdb.rcvdDbSaveTimer.UpdateSince(before)
+
+	return err
 }
 
 // storeRoundState will store the currentRoundState in a Map<view, roundState> schema.
@@ -172,17 +311,25 @@ func (rsdb *roundStateDBImpl) UpdateLastRoundState(rs RoundState) error {
 	logger := rsdb.logger.New("func", "UpdateLastRoundState")
 	viewKey := view2Key(rs.View())
 
+	before := time.Now()
 	entryBytes, err := rlp.EncodeToBytes(rs)
+	rsdb.rsRLPEncTimer.UpdateSince(before)
+
 	if err != nil {
 		logger.Error("Failed to save roundState", "reason", "rlp encoding", "err", err)
 		return err
 	}
 
-	batch := new(leveldb.Batch)
+	rsdb.rsRLPMeter.Mark(int64(len(entryBytes)))
+
+	before = time.Now()
+	batch := rsdb.db.NewBatch()
 	batch.Put([]byte(lastViewKey), viewKey)
 	batch.Put(viewKey, entryBytes)
 
-	err = rsdb.db.Write(batch, nil)
+	err = batch.Write()
+	rsdb.rsDbSaveTimer.UpdateSince(before)
+
 	if err != nil {
 		logger.Error("Failed to save roundState", "reason", "levelDB write", "err", err, "func")
 	}
@@ -191,7 +338,7 @@ func (rsdb *roundStateDBImpl) UpdateLastRoundState(rs RoundState) error {
 }
 
 func (rsdb *roundStateDBImpl) GetLastView() (*istanbul.View, error) {
-	rawEntry, err := rsdb.db.Get([]byte(lastViewKey), nil)
+	rawEntry, err := rsdb.db.Get([]byte(lastViewKey))
 	if err != nil {
 		return nil, err
 	}
@@ -202,7 +349,7 @@ func (rsdb *roundStateDBImpl) GetLastView() (*istanbul.View, error) {
 func (rsdb *roundStateDBImpl) GetOldestValidView() (*istanbul.View, error) {
 	lastView, err := rsdb.GetLastView()
 	// If nothing stored all views are valid
-	if err == leveldb.ErrNotFound {
+	if err == goleveldb.ErrNotFound {
 		return &istanbul.View{Sequence: common.Big0, Round: common.Big0}, nil
 	} else if err != nil {
 		return nil, err
@@ -218,7 +365,7 @@ func (rsdb *roundStateDBImpl) GetOldestValidView() (*istanbul.View, error) {
 
 func (rsdb *roundStateDBImpl) GetRoundStateFor(view *istanbul.View) (RoundState, error) {
 	viewKey := view2Key(view)
-	rawEntry, err := rsdb.db.Get(viewKey, nil)
+	rawEntry, err := rsdb.db.Get(viewKey)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +374,35 @@ func (rsdb *roundStateDBImpl) GetRoundStateFor(view *istanbul.View) (RoundState,
 	if err = rlp.DecodeBytes(rawEntry, &entry); err != nil {
 		return nil, err
 	}
-	return &entry, nil
+	// Check if rcvd is stored
+	rcvdViewKey := rcvdView2Key(view)
+	rawRcvd, err := rsdb.db.Get(rcvdViewKey)
+	// No rcvd, return the roundstate as found
+	if err == goleveldb.ErrNotFound {
+		return &entry, nil
+	}
+	// Unknown error. Return the roundstate as found, but log the err
+	if err != nil {
+		return nil, err
+	}
+	var r *rcvdRLP = &rcvdRLP{}
+	if err = rlp.DecodeBytes(rawRcvd, &r); err != nil {
+		return nil, err
+	}
+	// Transform into rcvd
+	var res *rcvd = &rcvd{}
+	err = res.FromRLP(r)
+	if err != nil {
+		return nil, err
+	}
+	return merged(&entry, res), nil
+}
+
+func merged(rs *roundStateImpl, r *rcvd) *roundStateImpl {
+	rs.prepares.AddAll(r.Prepares.Values())
+	rs.commits.AddAll(r.Commits.Values())
+	rs.parentCommits.AddAll(r.ParentCommits.Values())
+	return rs
 }
 
 func (rsdb *roundStateDBImpl) Close() error {
@@ -260,13 +435,27 @@ func (rsdb *roundStateDBImpl) deleteEntriesOlderThan(lastView *istanbul.View) (i
 	fromViewKey := view2Key(&istanbul.View{Sequence: common.Big0, Round: common.Big0})
 	toViewKey := view2Key(lastView)
 
-	iter := rsdb.db.NewIterator(&util.Range{Start: fromViewKey, Limit: toViewKey}, nil)
-	defer iter.Release()
+	count, err := rsdb.deleteIteratorEntries(&util.Range{Start: fromViewKey, Limit: toViewKey})
+	if err != nil {
+		return count, err
+	}
 
+	fromRcvdKey := rcvdView2Key(&istanbul.View{Sequence: common.Big0, Round: common.Big0})
+	toRcvdKey := rcvdView2Key(lastView)
+	rcvdCount, err := rsdb.deleteIteratorEntries(&util.Range{Start: fromRcvdKey, Limit: toRcvdKey})
+	if err != nil {
+		return count + rcvdCount, err
+	}
+	return count + rcvdCount, nil
+}
+
+func (rsdb *roundStateDBImpl) deleteIteratorEntries(rang *util.Range) (int, error) {
+	iter := rsdb.db.NewRangeIterator(rang)
+	defer iter.Release()
 	counter := 0
 	for iter.Next() {
 		rawKey := iter.Key()
-		err := rsdb.db.Delete(rawKey, nil)
+		err := rsdb.db.Delete(rawKey)
 		if err != nil {
 			return counter, err
 		}
@@ -276,15 +465,26 @@ func (rsdb *roundStateDBImpl) deleteEntriesOlderThan(lastView *istanbul.View) (i
 }
 
 // view2Key will encode a view in binary format
-// so that the binary format maintains the sort order for the view
+// so that the binary format maintains the sort order for the view,
+// using the rsKey prefix
 func view2Key(view *istanbul.View) []byte {
+	return prefixView2Key(rsKey, view)
+}
+
+// rcvdView2Key will encode a view in binary format
+// so that the binary format maintains the sort order for the view,
+// using the rcvdKey prefix
+func rcvdView2Key(view *istanbul.View) []byte {
+	return prefixView2Key(rcvdKey, view)
+}
+
+func prefixView2Key(prefix string, view *istanbul.View) []byte {
 	// leveldb sorts entries by key
 	// keys are sorted with their binary representation, so we need a binary representation
 	// that mantains the key order
 	// The key format is [ prefix . BigEndian(Sequence) . BigEndian(Round)]
 	// We use BigEndian so to maintain order in binary format
 	// And we want to sort by (seq, round); since seq had higher precedence than round
-	prefix := []byte(rsKey)
 	buff := make([]byte, len(prefix)+16)
 
 	copy(buff, prefix)

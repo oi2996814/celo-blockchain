@@ -84,8 +84,10 @@ type RPCTransaction struct {
 	EthCompatible       bool            `json:"ethCompatible"`
 }
 
-// UnmarshalJSON parses the given JSON fragment into a BlockNumber. It supports:
-// - "latest", "earliest" or "pending" as string arguments
+// UnmarshalJSON parses the given JSON fragment into a BlockNumber. It
+// supports: - "finalized", latest", "earliest" or "pending" as string
+// arguments where finalized is equivalent to latest since all blocks are final
+// in celo.
 // - the block number
 // Returned errors:
 // - an invalid block number error when the given argument isn't a known strings
@@ -106,6 +108,9 @@ func (bn *BlockNumber) UnmarshalJSON(data []byte) error {
 	case "pending":
 		*bn = PendingBlockNumber
 		return nil
+	case "finalized":
+		*bn = LatestBlockNumber
+		return nil
 	}
 
 	blckNum, err := hexutil.DecodeUint64(input)
@@ -117,6 +122,22 @@ func (bn *BlockNumber) UnmarshalJSON(data []byte) error {
 	}
 	*bn = BlockNumber(blckNum)
 	return nil
+}
+
+// MarshalText implements encoding.TextMarshaler. It marshals:
+// - "latest", "earliest" or "pending" as strings
+// - other numbers as hex
+func (bn BlockNumber) MarshalText() ([]byte, error) {
+	switch bn {
+	case EarliestBlockNumber:
+		return []byte("earliest"), nil
+	case LatestBlockNumber:
+		return []byte("latest"), nil
+	case PendingBlockNumber:
+		return []byte("pending"), nil
+	default:
+		return hexutil.Uint64(bn).MarshalText()
+	}
 }
 
 func (bn BlockNumber) Int64() int64 {
@@ -153,6 +174,10 @@ func (bnh *BlockNumberOrHash) UnmarshalJSON(data []byte) error {
 		bnh.BlockNumber = &bn
 		return nil
 	case "latest":
+		bn := LatestBlockNumber
+		bnh.BlockNumber = &bn
+		return nil
+	case "finalized":
 		bn := LatestBlockNumber
 		bnh.BlockNumber = &bn
 		return nil

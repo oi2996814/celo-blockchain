@@ -25,51 +25,15 @@ import (
 // On release branches, it should be a beta or stable.  For example:
 // "1.3.0-beta", "1.3.0-beta.2", etc. and then "1.3.0-stable", "1.3.1-stable", etc.
 const (
-	VersionMajor = 1          // Major version component of the current release
-	VersionMinor = 6          // Minor version component of the current release
-	VersionPatch = 0          // Patch version component of the current release
-	VersionMeta  = "unstable" // Version metadata to append to the version string
+	VersionMajor = 1        // Major version component of the current release
+	VersionMinor = 8        // Minor version component of the current release
+	VersionPatch = 2        // Patch version component of the current release
+	VersionMeta  = "stable" // Version metadata to append to the version string
 )
-
-type VersionInfo struct {
-	Major uint64
-	Minor uint64
-	Patch uint64
-}
-
-// Cmp compares x and y and returns:
-//
-//   -1 if x <  y
-//    0 if x == y
-//   +1 if x >  y
-//
-func cmp(x uint64, y uint64) int {
-	if x < y {
-		return -1
-	}
-	if x > y {
-		return 1
-	}
-	return 0
-}
-
-func (v *VersionInfo) Cmp(version *VersionInfo) int {
-	if v.Major == version.Major {
-		if v.Minor == version.Minor {
-			return cmp(v.Patch, version.Patch)
-		}
-		return cmp(v.Minor, version.Minor)
-	}
-	return cmp(v.Major, version.Major)
-}
 
 // Version holds the textual version string.
 var Version = func() string {
 	return fmt.Sprintf("%d.%d.%d", VersionMajor, VersionMinor, VersionPatch)
-}()
-
-var CurrentVersionInfo = func() *VersionInfo {
-	return &VersionInfo{VersionMajor, VersionMinor, VersionPatch}
 }()
 
 // VersionWithMeta holds the textual version string including the metadata.
@@ -83,7 +47,8 @@ var VersionWithMeta = func() string {
 
 // ArchiveVersion holds the textual version string used for Geth archives.
 // e.g. "1.8.11-dea1ce05" for stable releases, or
-//      "1.8.13-unstable-21c059b6" for unstable releases
+//
+//	"1.8.13-unstable-21c059b6" for unstable releases
 func ArchiveVersion(gitCommit string) string {
 	vsn := Version
 	if VersionMeta != "stable" {

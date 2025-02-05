@@ -112,7 +112,7 @@ func (s *PublicEthereumAPI) MaxPriorityFeePerGas(ctx context.Context, feeCurrenc
 // - pulledStates:  number of state entries processed until now
 // - knownStates:   number of known state entries that still need to be pulled
 func (s *PublicEthereumAPI) Syncing() (interface{}, error) {
-	progress := s.b.Downloader().Progress()
+	progress := s.b.SyncProgress()
 
 	// Return not syncing if the synchronisation already completed
 	if progress.CurrentBlock >= progress.HighestBlock {
@@ -146,14 +146,11 @@ func (s *PublicTxPoolAPI) Content() map[string]map[string]map[string]*RPCTransac
 	}
 	pending, queue := s.b.TxPoolContent()
 	curHeader := s.b.CurrentHeader()
-	baseFeeFn := func(feeCurrency *common.Address) (*big.Int, error) {
-		return s.b.CurrentGasPriceMinimum(context.Background(), feeCurrency)
-	}
 	// Flatten the pending transactions
 	for account, txs := range pending {
 		dump := make(map[string]*RPCTransaction)
 		for _, tx := range txs {
-			dump[fmt.Sprintf("%d", tx.Nonce())] = newRPCPendingTransaction(tx, curHeader, s.b.ChainConfig(), baseFeeFn)
+			dump[fmt.Sprintf("%d", tx.Nonce())] = NewRPCPendingTransaction(tx, curHeader, s.b.ChainConfig())
 		}
 		content["pending"][account.Hex()] = dump
 	}
@@ -161,7 +158,7 @@ func (s *PublicTxPoolAPI) Content() map[string]map[string]map[string]*RPCTransac
 	for account, txs := range queue {
 		dump := make(map[string]*RPCTransaction)
 		for _, tx := range txs {
-			dump[fmt.Sprintf("%d", tx.Nonce())] = newRPCPendingTransaction(tx, curHeader, s.b.ChainConfig(), baseFeeFn)
+			dump[fmt.Sprintf("%d", tx.Nonce())] = NewRPCPendingTransaction(tx, curHeader, s.b.ChainConfig())
 		}
 		content["queued"][account.Hex()] = dump
 	}
@@ -176,18 +173,15 @@ func (s *PublicTxPoolAPI) ContentFrom(addr common.Address) map[string]map[string
 
 	// Build the pending transactions
 	dump := make(map[string]*RPCTransaction, len(pending))
-	baseFeeFn := func(feeCurrency *common.Address) (*big.Int, error) {
-		return s.b.CurrentGasPriceMinimum(context.Background(), feeCurrency)
-	}
 	for _, tx := range pending {
-		dump[fmt.Sprintf("%d", tx.Nonce())] = newRPCPendingTransaction(tx, curHeader, s.b.ChainConfig(), baseFeeFn)
+		dump[fmt.Sprintf("%d", tx.Nonce())] = NewRPCPendingTransaction(tx, curHeader, s.b.ChainConfig())
 	}
 	content["pending"] = dump
 
 	// Build the queued transactions
 	dump = make(map[string]*RPCTransaction, len(queue))
 	for _, tx := range queue {
-		dump[fmt.Sprintf("%d", tx.Nonce())] = newRPCPendingTransaction(tx, curHeader, s.b.ChainConfig(), baseFeeFn)
+		dump[fmt.Sprintf("%d", tx.Nonce())] = NewRPCPendingTransaction(tx, curHeader, s.b.ChainConfig())
 
 	}
 	content["queued"] = dump
@@ -700,33 +694,90 @@ func (s *PublicBlockChainAPI) GetHeaderByHash(ctx context.Context, hash common.H
 }
 
 // GetBlockByNumber returns the requested canonical block.
-// * When blockNr is -1 the chain head is returned.
-// * When blockNr is -2 the pending chain head is returned.
-// * When fullTx is true all transactions in the block are returned, otherwise
-//   only the transaction hash is returned.
+//   - When blockNr is -1 the chain head is returned.
+//   - When blockNr is -2 the pending chain head is returned.
+//   - When fullTx is true all transactions in the block are returned, otherwise
+//     only the transaction hash is returned.
 func (s *PublicBlockChainAPI) GetBlockByNumber(ctx context.Context, number rpc.BlockNumber, fullTx bool) (map[string]interface{}, error) {
 	block, err := s.b.BlockByNumber(ctx, number)
-	if block != nil && err == nil {
-		response, err := s.rpcMarshalBlock(ctx, block, true, fullTx)
-		if err == nil && number == rpc.PendingBlockNumber {
+	if block == nil || err != nil {
+		return nil, err
+	}
+	response, err := s.rpcMarshalBlock(ctx, block, true, fullTx)
+	if err == nil {
+		if s.b.RPCEthCompatibility() {
+			addEthCompatibilityFields(ctx, response, s.b, block)
+		}
+		if number == rpc.PendingBlockNumber {
 			// Pending blocks need to nil out a few fields
 			for _, field := range []string{"hash", "nonce", "miner"} {
 				response[field] = nil
 			}
 		}
-		return response, err
 	}
-	return nil, err
+	return response, err
 }
 
 // GetBlockByHash returns the requested block. When fullTx is true all transactions in the block are returned in full
 // detail, otherwise only the transaction hash is returned.
 func (s *PublicBlockChainAPI) GetBlockByHash(ctx context.Context, hash common.Hash, fullTx bool) (map[string]interface{}, error) {
 	block, err := s.b.BlockByHash(ctx, hash)
-	if block != nil {
-		return s.rpcMarshalBlock(ctx, block, true, fullTx)
+	if block == nil {
+		return nil, err
 	}
-	return nil, err
+	result, err := s.rpcMarshalBlock(ctx, block, true, fullTx)
+	if err != nil {
+		return nil, err
+	}
+	if s.b.RPCEthCompatibility() {
+		addEthCompatibilityFields(ctx, result, s.b, block)
+	}
+	return result, nil
+}
+
+// addEthCompatibilityFields seeks to work around the incompatibility of celo
+// and ethers.js (and potentially other web3 clients) by adding fields to our
+// rpc response that ethers.js depends upon.
+// See https://github.com/celo-org/celo-blockchain/issues/1945
+func addEthCompatibilityFields(ctx context.Context, response map[string]interface{}, b Backend, block *types.Block) {
+	header := block.Header()
+	if !b.ChainConfig().IsGingerbread(block.Number()) {
+		// Before Gingerbread, the header did not include the gasLimit, now we manually add it for old blocks.
+		var gasLimit uint64
+		var err error
+
+		// For mainnet, alfajores and baklava we have a set of hardcoded values derived from historical state that we can
+		// use, note ChainID might be unset, so we need to account for that.
+		chainId := b.ChainConfig().ChainID
+		if chainId != nil && params.PreGingerbreadNetworkGasLimits[chainId.Uint64()] != nil {
+			gasLimit = params.PreGingerbreadNetworkGasLimits[chainId.Uint64()].Limit(header.Number)
+		} else {
+			// If no hardcoded limits are available for this network then we will try to look up the gas limit in the state.
+			hash := header.Hash()
+			numhash := rpc.BlockNumberOrHash{
+				BlockHash: &hash,
+			}
+			gasLimit, err = b.GetRealBlockGasLimit(ctx, numhash)
+			if err != nil {
+				log.Debug("Failed to retrieve gas limit for RPC block response, zero gas limit will be returned", "block", header.Number.Uint64(), "err", err)
+			}
+		}
+		response["gasLimit"] = hexutil.Uint64(gasLimit)
+	}
+
+	if header.BaseFee != nil {
+		response["baseFeePerGas"] = (*hexutil.Big)(header.BaseFee)
+	} else {
+		// Providing nil as the currency address gets the gas price minimum for the native celo asset.
+		baseFee, err := b.RealGasPriceMinimumForHeader(ctx, nil, header)
+		if err != nil {
+			log.Debug("Not adding baseFeePerGas to RPC response, failed to retrieve gas price minimum", "block", header.Number.Uint64(), "err", err)
+		} else {
+			response["baseFeePerGas"] = (*hexutil.Big)(baseFee)
+		}
+	}
+
+	response["difficulty"] = "0x0"
 }
 
 // GetUncleByBlockNumberAndIndex returns the uncle block for the given block hash and index. When fullTx is true
@@ -771,6 +822,42 @@ func (s *PublicBlockChainAPI) GetStorageAt(ctx context.Context, address common.A
 	}
 	res := state.GetState(address, common.HexToHash(key))
 	return res[:], state.Error()
+}
+
+// GetBlockReceipts returns the block receipts for the given block hash or number or tag.
+func (s *PublicBlockChainAPI) GetBlockReceipts(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) ([]map[string]interface{}, error) {
+	block, err := s.b.BlockByNumberOrHash(ctx, blockNrOrHash)
+	if block == nil || err != nil {
+		// When the block doesn't exist, the RPC method should return JSON null
+		// as per specification.
+		return nil, nil
+	}
+	receipts, err := s.b.GetReceipts(ctx, block.Hash())
+	if err != nil {
+		return nil, err
+	}
+	txs := block.Transactions()
+	// We need to account for the block receipt, which if present will mean
+	// that there is one more receipt than transactions.
+	if len(txs) != len(receipts) && len(txs)+1 != len(receipts) {
+		return nil, fmt.Errorf("receipts length mismatch: %d vs %d", len(txs), len(receipts))
+	}
+
+	// Derive the sender.
+	signer := types.MakeSigner(s.b.ChainConfig(), block.Number())
+	result := make([]map[string]interface{}, len(receipts))
+	for i, receipt := range receipts {
+		var tx *types.Transaction
+		if i < len(txs) {
+			tx = txs[i]
+		}
+		result[i], err = generateReceiptResponse(ctx, s.b, receipt, signer, tx, block.Hash(), block.NumberU64(), uint64(i))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return result, nil
 }
 
 // OverrideAccount indicates the overriding fields of account during the execution
@@ -825,7 +912,7 @@ func (diff *StateOverride) Apply(state *state.StateDB) error {
 	return nil
 }
 
-func DoCall(ctx context.Context, b Backend, args TransactionArgs, blockNrOrHash rpc.BlockNumberOrHash, overrides *StateOverride, timeout time.Duration, globalGasCap uint64) (*core.ExecutionResult, error) {
+func DoCall(ctx context.Context, b Backend, args TransactionArgs, blockNrOrHash rpc.BlockNumberOrHash, overrides *StateOverride, timeout time.Duration, globalGasCap uint64, skipDebitCredit bool) (*core.ExecutionResult, error) {
 	defer func(start time.Time) { log.Debug("Executing EVM call finished", "runtime", time.Since(start)) }(time.Now())
 
 	state, header, err := b.StateAndHeaderByNumberOrHash(ctx, blockNrOrHash)
@@ -850,19 +937,15 @@ func DoCall(ctx context.Context, b Backend, args TransactionArgs, blockNrOrHash 
 	// Create SysContractCallCtx
 	var sysCtx *core.SysContractCallCtx
 	if b.ChainConfig().IsEspresso(header.Number) {
-		vmRunner := b.NewEVMRunner(header, state)
-		if err != nil {
-			return nil, err
-		}
-		sysCtx = core.NewSysContractCallCtx(vmRunner)
+		sysCtx = core.NewSysContractCallCtx(header, state, b)
 	}
 
 	// Get a new instance of the EVM.
-	msg, err := args.ToMessage(globalGasCap, common.Big0) // core.ApplyMessageWithoutGasPriceMinimum below will eventually set basefee to 0
+	msg, err := args.ToMessage(globalGasCap, header.BaseFee)
 	if err != nil {
 		return nil, err
 	}
-	evm, vmError, err := b.GetEVM(ctx, msg, state, header, &vm.Config{NoBaseFee: true})
+	evm, vmError, err := b.GetEVM(ctx, msg, state, header, &vm.Config{NoBaseFee: true, SkipDebitCredit: skipDebitCredit})
 	if err != nil {
 		return nil, err
 	}
@@ -875,7 +958,8 @@ func DoCall(ctx context.Context, b Backend, args TransactionArgs, blockNrOrHash 
 
 	// Execute the message.
 	gp := new(core.GasPool).AddGas(math.MaxUint64)
-	result, err := core.ApplyMessageWithoutGasPriceMinimum(evm, msg, gp, b.NewEVMRunner(header, state), sysCtx)
+	vmRunner := b.NewEVMRunner(header, state)
+	result, err := core.ApplyMessage(evm, msg, gp, vmRunner, sysCtx)
 	if err := vmError(); err != nil {
 		return nil, err
 	}
@@ -927,7 +1011,7 @@ func (e *revertError) ErrorData() interface{} {
 // Note, this function doesn't make and changes in the state/blockchain and is
 // useful to execute and retrieve values.
 func (s *PublicBlockChainAPI) Call(ctx context.Context, args TransactionArgs, blockNrOrHash rpc.BlockNumberOrHash, overrides *StateOverride) (hexutil.Bytes, error) {
-	result, err := DoCall(ctx, s.b, args, blockNrOrHash, overrides, 50*time.Second, s.b.RPCGasCap())
+	result, err := DoCall(ctx, s.b, args, blockNrOrHash, overrides, 50*time.Second, s.b.RPCGasCap(), false)
 	if err != nil {
 		return nil, err
 	}
@@ -945,6 +1029,11 @@ func DoEstimateGas(ctx context.Context, b Backend, args TransactionArgs, blockNr
 		hi  uint64
 		cap uint64
 	)
+	// Use zero address if sender unspecified.
+	if args.From == nil {
+		args.From = new(common.Address)
+	}
+	// Determine the highest gas limit can be used during the estimation.
 	if args.Gas != nil && uint64(*args.Gas) >= params.TxGas {
 		hi = uint64(*args.Gas)
 	} else {
@@ -956,21 +1045,19 @@ func DoEstimateGas(ctx context.Context, b Backend, args TransactionArgs, blockNr
 		hi = gasCap
 	}
 	cap = hi
-
-	// Use zero address if sender unspecified.
-	if args.From == nil {
-		args.From = new(common.Address)
-	}
 	// Set gas price to nil (which will lead to it being zero), because the binary search
 	// assumes that if the transaction fails with gas limit A, and B < A, then it would
 	// also fail with gas limit B, which may not be the case if the gas price is non-zero,
 	// depending on the account's balance.
 	args.GasPrice = nil
+	// If a fee tip or fee cap are passed, those will override the gas price, so zero them out as well.
+	args.MaxFeePerGas = nil
+	args.MaxPriorityFeePerGas = nil
 	// Create a helper to check if a gas allowance results in an executable transaction
 	executable := func(gas uint64) (bool, *core.ExecutionResult, error) {
 		args.Gas = (*hexutil.Uint64)(&gas)
 
-		result, err := DoCall(ctx, b, args, blockNrOrHash, nil, 0, gasCap)
+		result, err := DoCall(ctx, b, args, blockNrOrHash, nil, 0, gasCap, true)
 		if err != nil {
 			if errors.Is(err, core.ErrIntrinsicGas) {
 				return true, nil, nil // Special case, raise gas limit
@@ -1104,6 +1191,24 @@ func RPCMarshalHeader(head *types.Header) map[string]interface{} {
 		"transactionsRoot": head.TxHash,
 		"receiptsRoot":     head.ReceiptHash,
 	}
+	// Former proof-of-work fields, now constants, see https://eips.ethereum.org/EIPS/eip-3675#block-structure
+	// Set after Gingerbread
+	if head.Difficulty != nil {
+		result["difficulty"] = (*hexutil.Big)(head.Difficulty)
+		result["nonce"] = head.Nonce
+		result["sha3Uncles"] = head.UncleHash
+		result["uncles"] = []interface{}{}
+		result["mixHash"] = head.MixDigest
+	}
+
+	// Before the gingerbread hardfork gas limit was not part of the block header.
+	if head.GasLimit > 0 {
+		result["gasLimit"] = hexutil.Uint64(head.GasLimit)
+	}
+
+	if head.BaseFee != nil {
+		result["baseFeePerGas"] = (*hexutil.Big)(head.BaseFee)
+	}
 
 	return result
 }
@@ -1163,7 +1268,7 @@ func (s *PublicBlockChainAPI) rpcMarshalHeader(ctx context.Context, header *type
 // rpcMarshalBlock uses the generalized output filler, then adds the total difficulty field, which requires
 // a `PublicBlockchainAPI`.
 func (s *PublicBlockChainAPI) rpcMarshalBlock(ctx context.Context, b *types.Block, inclTx bool, fullTx bool) (map[string]interface{}, error) {
-	baseFeeFn := getGasPriceMinimumFromState(ctx, s.b, b.Hash())
+	baseFeeFn := getGasPriceMinimumFromStateWithHeader(ctx, s.b, b.Header())
 	fields, err := RPCMarshalBlock(b, inclTx, fullTx, baseFeeFn)
 	if err != nil {
 		return nil, err
@@ -1183,9 +1288,9 @@ type RPCTransaction struct {
 	GasPrice            *hexutil.Big      `json:"gasPrice"`
 	GasFeeCap           *hexutil.Big      `json:"maxFeePerGas,omitempty"`
 	GasTipCap           *hexutil.Big      `json:"maxPriorityFeePerGas,omitempty"`
-	FeeCurrency         *common.Address   `json:"feeCurrency"`
-	GatewayFeeRecipient *common.Address   `json:"gatewayFeeRecipient"`
-	GatewayFee          *hexutil.Big      `json:"gatewayFee"`
+	FeeCurrency         *common.Address   `json:"feeCurrency,omitempty"`
+	GatewayFeeRecipient *common.Address   `json:"gatewayFeeRecipient,omitempty"`
+	GatewayFee          *hexutil.Big      `json:"gatewayFee,omitempty"`
 	Hash                common.Hash       `json:"hash"`
 	Input               hexutil.Bytes     `json:"input"`
 	Nonce               hexutil.Uint64    `json:"nonce"`
@@ -1198,12 +1303,16 @@ type RPCTransaction struct {
 	V                   *hexutil.Big      `json:"v"`
 	R                   *hexutil.Big      `json:"r"`
 	S                   *hexutil.Big      `json:"s"`
-	EthCompatible       bool              `json:"ethCompatible"`
+	EthCompatible       *bool             `json:"ethCompatible,omitempty"`
 }
 
 // newRPCTransaction returns a transaction that will serialize to the RPC
 // representation, with the given location metadata set (if available).
-func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber uint64, index uint64, baseFeeFn func(feeCurrency *common.Address) (*big.Int, error)) *RPCTransaction {
+// *** Upstream difference ***
+// The `inABlock` flag was added to avoid ambiguity. A Tx in a pending block, will be
+// part of a block. The usage in this file of a `!inABlock`, is for asking for pending txs
+// in the pool that are not even part of the pending block.
+func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber uint64, index uint64, baseFeeFn func(feeCurrency *common.Address) (*big.Int, error), inABlock bool) *RPCTransaction {
 	// Determine the signer. For replay-protected transactions, use the most permissive
 	// signer, because we assume that signers are backwards-compatible with old
 	// transactions. For non-protected transactions, the homestead signer signer is used
@@ -1232,27 +1341,46 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 		V:                   (*hexutil.Big)(v),
 		R:                   (*hexutil.Big)(r),
 		S:                   (*hexutil.Big)(s),
-		EthCompatible:       tx.EthCompatible(),
+	}
+	// Set eth compatible for legacy transactions only
+	if tx.Type() == types.LegacyTxType {
+		ec := tx.EthCompatible()
+		result.EthCompatible = &ec
 	}
 	if blockHash != (common.Hash{}) {
 		result.BlockHash = &blockHash
 		result.BlockNumber = (*hexutil.Big)(new(big.Int).SetUint64(blockNumber))
 		result.TransactionIndex = (*hexutil.Uint64)(&index)
 	}
+	// Celo specifics
+	if tx.Type() == types.LegacyTxType || tx.Type() == types.CeloDynamicFeeTxType || tx.Type() == types.CeloDynamicFeeTxV2Type || tx.Type() == types.CeloDenominatedTxType {
+		result.FeeCurrency = tx.FeeCurrency()
+		if tx.Type() == types.LegacyTxType || tx.Type() == types.CeloDynamicFeeTxType {
+			result.GatewayFeeRecipient = tx.GatewayFeeRecipient()
+			result.GatewayFee = (*hexutil.Big)(tx.GatewayFee())
+		}
+	}
+
 	switch tx.Type() {
 	case types.AccessListTxType:
 		al := tx.AccessList()
 		result.Accesses = &al
 		result.ChainID = (*hexutil.Big)(tx.ChainId())
-	case types.DynamicFeeTxType, types.CeloDynamicFeeTxType:
+	case types.DynamicFeeTxType, types.CeloDynamicFeeTxType, types.CeloDynamicFeeTxV2Type, types.CeloDenominatedTxType:
 		al := tx.AccessList()
 		result.Accesses = &al
 		result.ChainID = (*hexutil.Big)(tx.ChainId())
 		result.GasFeeCap = (*hexutil.Big)(tx.GasFeeCap())
 		result.GasTipCap = (*hexutil.Big)(tx.GasTipCap())
 		// if the transaction has been mined, compute the effective gas price
-		if blockHash != (common.Hash{}) {
-			baseFee, err := baseFeeFn(tx.FeeCurrency())
+		// if blockHash != (common.Hash{}) { // This is from upstream (check the function comment above).
+		if inABlock {
+			var currency *common.Address = tx.FeeCurrency()
+			// Celo Denominated txs are denominated in celo
+			if tx.Type() == types.CeloDenominatedTxType {
+				currency = nil
+			}
+			baseFee, err := baseFeeFn(currency)
 			if err == nil {
 				// price = min(tip, gasFeeCap - baseFee) + baseFee
 				price := math.BigMin(new(big.Int).Add(tx.GasTipCap(), baseFee), tx.GasFeeCap())
@@ -1260,6 +1388,7 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 			} else {
 				log.Warn("error retrieving baseFee for tx", "hash", tx.Hash().Hex(), "error", err)
 				// error != nil for DynamicFees implies that there is no state to retrieve the baseFee for that block
+				// (after the Gingerbread Fork, only the alternative currencies with no state)
 				result.GasPrice = nil
 			}
 		} else {
@@ -1269,9 +1398,10 @@ func newRPCTransaction(tx *types.Transaction, blockHash common.Hash, blockNumber
 	return result
 }
 
-// newRPCPendingTransaction returns a pending transaction that will serialize to the RPC representation
-func newRPCPendingTransaction(tx *types.Transaction, current *types.Header, config *params.ChainConfig, baseFeeFn func(*common.Address) (*big.Int, error)) *RPCTransaction {
-	return newRPCTransaction(tx, common.Hash{}, 0, 0, baseFeeFn)
+// NewRPCPendingTransaction returns a pending transaction that will serialize to the RPC representation
+func NewRPCPendingTransaction(tx *types.Transaction, current *types.Header, config *params.ChainConfig) *RPCTransaction {
+	// With `inABlock` set to `false, `baseFeeFn` is never called
+	return newRPCTransaction(tx, common.Hash{}, 0, 0, nil, false)
 }
 
 // newRPCTransactionFromBlockIndex returns a transaction that will serialize to the RPC representation.
@@ -1280,7 +1410,7 @@ func newRPCTransactionFromBlockIndex(b *types.Block, index uint64, baseFeeFn fun
 	if index >= uint64(len(txs)) {
 		return nil
 	}
-	return newRPCTransaction(txs[index], b.Hash(), b.NumberU64(), index, baseFeeFn)
+	return newRPCTransaction(txs[index], b.Hash(), b.NumberU64(), index, baseFeeFn, true)
 }
 
 // newRPCRawTransactionFromBlockIndex returns the bytes of a transaction given a block and a transaction index.
@@ -1356,6 +1486,12 @@ func AccessList(ctx context.Context, b Backend, blockNrOrHash rpc.BlockNumberOrH
 	// Retrieve the precompiles since they don't need to be added to the access list
 	precompiles := vm.ActivePrecompiles(b.ChainConfig().Rules(header.Number))
 
+	// Create SysContractCallCtx
+	var sysCtx *core.SysContractCallCtx
+	if b.ChainConfig().IsEspresso(header.Number) {
+		sysCtx = core.NewSysContractCallCtx(header, db, b)
+	}
+
 	// Create an initial tracer
 	prevTracer := vm.NewAccessListTracer(nil, args.from(), to, precompiles)
 	if args.AccessList != nil {
@@ -1396,7 +1532,7 @@ func AccessList(ctx context.Context, b Backend, blockNrOrHash rpc.BlockNumberOrH
 			return nil, 0, nil, err
 		}
 		vmRunner := b.NewEVMRunner(header, statedb)
-		res, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(msg.Gas()), vmRunner, nil)
+		res, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(msg.Gas()), vmRunner, sysCtx)
 		if err != nil {
 			return nil, 0, nil, fmt.Errorf("failed to apply transaction: %v err: %v", args.toTransaction().Hash(), err)
 		}
@@ -1443,7 +1579,7 @@ func (s *PublicTransactionPoolAPI) GetBlockTransactionCountByHash(ctx context.Co
 // GetTransactionByBlockNumberAndIndex returns the transaction for the given block number and index.
 func (s *PublicTransactionPoolAPI) GetTransactionByBlockNumberAndIndex(ctx context.Context, blockNr rpc.BlockNumber, index hexutil.Uint) *RPCTransaction {
 	if block, _ := s.b.BlockByNumber(ctx, blockNr); block != nil {
-		baseFeeFn := getGasPriceMinimumFromState(ctx, s.b, block.Hash())
+		baseFeeFn := getGasPriceMinimumFromStateWithHeader(ctx, s.b, block.Header())
 
 		return newRPCTransactionFromBlockIndex(block, uint64(index), baseFeeFn)
 	}
@@ -1453,7 +1589,7 @@ func (s *PublicTransactionPoolAPI) GetTransactionByBlockNumberAndIndex(ctx conte
 // GetTransactionByBlockHashAndIndex returns the transaction for the given block hash and index.
 func (s *PublicTransactionPoolAPI) GetTransactionByBlockHashAndIndex(ctx context.Context, blockHash common.Hash, index hexutil.Uint) *RPCTransaction {
 	if block, _ := s.b.BlockByHash(ctx, blockHash); block != nil {
-		baseFeeFn := getGasPriceMinimumFromState(ctx, s.b, blockHash)
+		baseFeeFn := getGasPriceMinimumFromStateWithHeader(ctx, s.b, block.Header())
 		return newRPCTransactionFromBlockIndex(block, uint64(index), baseFeeFn)
 	}
 	return nil
@@ -1503,14 +1639,11 @@ func (s *PublicTransactionPoolAPI) GetTransactionByHash(ctx context.Context, has
 	}
 	if tx != nil {
 		baseFeeFn := getGasPriceMinimumFromState(ctx, s.b, blockHash)
-		return newRPCTransaction(tx, blockHash, blockNumber, index, baseFeeFn), nil
+		return newRPCTransaction(tx, blockHash, blockNumber, index, baseFeeFn, true), nil
 	}
 	// No finalized transaction, try to retrieve it from the pool
 	if tx := s.b.GetPoolTransaction(hash); tx != nil {
-		baseFeeFn := func(feeCurrency *common.Address) (*big.Int, error) {
-			return s.b.CurrentGasPriceMinimum(context.Background(), tx.FeeCurrency())
-		}
-		return newRPCPendingTransaction(tx, s.b.CurrentHeader(), s.b.ChainConfig(), baseFeeFn), nil
+		return NewRPCPendingTransaction(tx, s.b.CurrentHeader(), s.b.ChainConfig()), nil
 	}
 
 	// Transaction unknown, return as such
@@ -1523,7 +1656,18 @@ func getGasPriceMinimumFromState(ctx context.Context, b Backend, blockHash commo
 		if err != nil {
 			return nil, err
 		}
+		return getGasPriceMinimumFromStateWithHeader(ctx, b, header)(feeCurrency)
+	}
+}
 
+func getGasPriceMinimumFromStateWithHeader(ctx context.Context, b Backend, header *types.Header) func(feeCurrency *common.Address) (*big.Int, error) {
+	return func(feeCurrency *common.Address) (*big.Int, error) {
+		return b.GasPriceMinimumForHeader(ctx, feeCurrency, header)
+	}
+}
+
+func getRateFromStateWithHeader(ctx context.Context, b Backend, header *types.Header) func(feeCurrency *common.Address) (*big.Int, error) {
+	return func(feeCurrency *common.Address) (*big.Int, error) {
 		return b.GasPriceMinimumForHeader(ctx, feeCurrency, header)
 	}
 }
@@ -1562,25 +1706,9 @@ func (s *PublicTransactionPoolAPI) GetTransactionReceipt(ctx context.Context, ha
 	bigblock := new(big.Int).SetUint64(blockNumber)
 	signer := types.MakeSigner(s.b.ChainConfig(), bigblock)
 
-	fields := generateReceiptResponse(receipt, signer, tx, blockHash, blockNumber, index)
-	// Assign the effective gas price paid
-	if !s.b.ChainConfig().IsEspresso(bigblock) {
-		fields["effectiveGasPrice"] = hexutil.Uint64(tx.GasPrice().Uint64())
-	} else {
-		// var gasPrice *big.Int = new(big.Int)
-		if tx.Type() == types.DynamicFeeTxType || tx.Type() == types.CeloDynamicFeeTxType {
-			header, err := s.b.HeaderByHash(ctx, blockHash)
-			if err != nil {
-				return nil, err
-			}
-			gasPriceMinimum, err := s.b.GasPriceMinimumForHeader(ctx, tx.FeeCurrency(), header)
-			if err == nil {
-				fields["effectiveGasPrice"] = hexutil.Uint64(new(big.Int).Add(gasPriceMinimum, tx.EffectiveGasTipValue(gasPriceMinimum)).Uint64())
-			}
-			// if err != nil, it's due to a state prune. In this case no effectiveGasPrice will be returned.
-		} else {
-			fields["effectiveGasPrice"] = hexutil.Uint64(tx.GasPrice().Uint64())
-		}
+	fields, err := generateReceiptResponse(ctx, s.b, receipt, signer, tx, blockHash, blockNumber, index)
+	if err != nil {
+		return nil, err
 	}
 	return fields, nil
 }
@@ -1610,7 +1738,10 @@ func (s *PublicTransactionPoolAPI) GetBlockReceipt(ctx context.Context, hash com
 	} else {
 		receipt = receipts[index]
 	}
-	fields := generateReceiptResponse(receipt, nil, nil, hash, blockNumber, index)
+	fields, err := generateReceiptResponse(ctx, s.b, receipt, nil, nil, hash, blockNumber, index)
+	if err != nil {
+		return nil, err
+	}
 	return fields, nil
 }
 
@@ -1800,13 +1931,10 @@ func (s *PublicTransactionPoolAPI) PendingTransactions() ([]*RPCTransaction, err
 	}
 	curHeader := s.b.CurrentHeader()
 	transactions := make([]*RPCTransaction, 0, len(pending))
-	baseFeeFn := func(feeCurrency *common.Address) (*big.Int, error) {
-		return s.b.CurrentGasPriceMinimum(context.Background(), feeCurrency)
-	}
 	for _, tx := range pending {
 		from, _ := types.Sender(s.signer, tx)
 		if _, exists := accounts[from]; exists {
-			transactions = append(transactions, newRPCPendingTransaction(tx, curHeader, s.b.ChainConfig(), baseFeeFn))
+			transactions = append(transactions, NewRPCPendingTransaction(tx, curHeader, s.b.ChainConfig()))
 		}
 	}
 	return transactions, nil
@@ -1973,8 +2101,8 @@ func toHexSlice(b [][]byte) []string {
 	return r
 }
 
-// generateReceiptResponse is a helper function which generates the response for GetTransactionReceipt() and GetBlockReceipt()
-func generateReceiptResponse(receipt *types.Receipt, signer types.Signer, tx *types.Transaction, blockHash common.Hash, blockNumber uint64, index uint64) map[string]interface{} {
+// generateReceiptResponse is a helper function which generates the response for GetTransactionReceipt(), GetBlockReceipt() and GetBlockReceipts()
+func generateReceiptResponse(ctx context.Context, backend Backend, receipt *types.Receipt, signer types.Signer, tx *types.Transaction, blockHash common.Hash, blockNumber uint64, index uint64) (map[string]interface{}, error) {
 	fields := map[string]interface{}{
 		"blockHash":         blockHash,
 		"blockNumber":       hexutil.Uint64(blockNumber),
@@ -1987,6 +2115,7 @@ func generateReceiptResponse(receipt *types.Receipt, signer types.Signer, tx *ty
 		"contractAddress":   nil,
 		"logs":              receipt.Logs,
 		"logsBloom":         receipt.Bloom,
+		"type":              hexutil.Uint(receipt.Type),
 	}
 
 	// Assign receipt status or post state.
@@ -2009,7 +2138,26 @@ func generateReceiptResponse(receipt *types.Receipt, signer types.Signer, tx *ty
 		// Derive the sender.
 		fields["from"], _ = types.Sender(signer, tx)
 		fields["to"] = tx.To()
-
+		// Assign the effective gas price paid
+		if !backend.ChainConfig().IsLondon(new(big.Int).SetUint64(blockNumber)) {
+			fields["effectiveGasPrice"] = hexutil.Uint64(tx.GasPrice().Uint64())
+		} else {
+			// var gasPrice *big.Int = new(big.Int)
+			if tx.Type() == types.DynamicFeeTxType || tx.Type() == types.CeloDynamicFeeTxType || tx.Type() == types.CeloDynamicFeeTxV2Type || tx.Type() == types.CeloDenominatedTxType {
+				header, err := backend.HeaderByHash(ctx, blockHash)
+				if err != nil {
+					return nil, err
+				}
+				gasPriceMinimum, err := backend.GasPriceMinimumForHeader(ctx, tx.DenominatedFeeCurrency(), header)
+				if err == nil {
+					fields["effectiveGasPrice"] = hexutil.Uint64(new(big.Int).Add(gasPriceMinimum, tx.EffectiveGasTipValue(gasPriceMinimum)).Uint64())
+				}
+				// if err != nil, it's due to a state prune. In this case no effectiveGasPrice will be returned.
+			} else {
+				fields["effectiveGasPrice"] = hexutil.Uint64(tx.GasPrice().Uint64())
+			}
+		}
 	}
-	return fields
+
+	return fields, nil
 }

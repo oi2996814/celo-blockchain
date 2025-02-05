@@ -19,14 +19,17 @@ import (
 var genesisMsgHash = common.HexToHash("ecc833a7747eaa8327335e8e0c6b6d8aa3a38d0063591e43ce116ccf5c89753e")
 
 // CreateCommonGenesisConfig generates a config starting point which templates can then customize further
-func CreateCommonGenesisConfig(chainID *big.Int, adminAccountAddress common.Address, istanbulConfig params.IstanbulConfig) *Config {
-	genesisConfig := BaseConfig()
+func CreateCommonGenesisConfig(chainID *big.Int, adminAccountAddress common.Address, istanbulConfig params.IstanbulConfig, gingerbreadBlock *big.Int) (*Config, error) {
+	genesisConfig := BaseConfig(gingerbreadBlock)
 	genesisConfig.ChainID = chainID
 	genesisConfig.GenesisTimestamp = uint64(time.Now().Unix())
 	genesisConfig.Istanbul = istanbulConfig
 	genesisConfig.Hardforks = HardforkConfig{
-		ChurritoBlock: common.Big0,
-		DonutBlock:    common.Big0,
+		ChurritoBlock:      common.Big0,
+		DonutBlock:         common.Big0,
+		EspressoBlock:      common.Big0,
+		GingerbreadBlock:   gingerbreadBlock,
+		GingerbreadP2Block: gingerbreadBlock,
 	}
 
 	// Make admin account manager of Governance & Reserve
@@ -46,20 +49,23 @@ func CreateCommonGenesisConfig(chainID *big.Int, adminAccountAddress common.Addr
 	genesisConfig.Reserve.FrozenAssetsDays = 0
 	genesisConfig.EpochRewards.Frozen = false
 
-	return genesisConfig
+	return genesisConfig, nil
 }
 
 func FundAccounts(genesisConfig *Config, accounts []env.Account) {
 	cusdBalances := make([]Balance, len(accounts))
 	ceurBalances := make([]Balance, len(accounts))
+	crealBalances := make([]Balance, len(accounts))
 	goldBalances := make([]Balance, len(accounts))
 	for i, acc := range accounts {
-		cusdBalances[i] = Balance{Account: acc.Address, Amount: (*big.Int)(token.MustNew("50000"))} // 50k cUSD
-		ceurBalances[i] = Balance{Account: acc.Address, Amount: (*big.Int)(token.MustNew("50000"))} // 50k cEUR
-		goldBalances[i] = Balance{Account: acc.Address, Amount: (*big.Int)(token.MustNew("50000"))} // 50k CELO
+		cusdBalances[i] = Balance{Account: acc.Address, Amount: (*big.Int)(token.MustNew("50000"))}  // 50k cUSD
+		ceurBalances[i] = Balance{Account: acc.Address, Amount: (*big.Int)(token.MustNew("50000"))}  // 50k cEUR
+		crealBalances[i] = Balance{Account: acc.Address, Amount: (*big.Int)(token.MustNew("50000"))} // 50k cREAL
+		goldBalances[i] = Balance{Account: acc.Address, Amount: (*big.Int)(token.MustNew("50000"))}  // 50k CELO
 	}
-	genesisConfig.StableTokenEUR.InitialBalances = ceurBalances
 	genesisConfig.StableToken.InitialBalances = cusdBalances
+	genesisConfig.StableTokenEUR.InitialBalances = ceurBalances
+	genesisConfig.StableTokenBRL.InitialBalances = crealBalances
 	genesisConfig.GoldToken.InitialBalances = goldBalances
 }
 

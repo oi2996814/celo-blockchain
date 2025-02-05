@@ -84,6 +84,7 @@ type stEnv struct {
 	GasLimit  uint64         `json:"currentGasLimit"   gencodec:"required"`
 	Number    uint64         `json:"currentNumber"     gencodec:"required"`
 	Timestamp uint64         `json:"currentTimestamp"  gencodec:"required"`
+	BaseFee   *big.Int       `json:"currentBaseFee"  gencodec:"optional"`
 }
 
 type stEnvMarshaling struct {
@@ -91,6 +92,7 @@ type stEnvMarshaling struct {
 	GasLimit  math.HexOrDecimal64
 	Number    math.HexOrDecimal64
 	Timestamp math.HexOrDecimal64
+	BaseFee   *math.HexOrDecimal256
 }
 
 //go:generate gencodec -type stTransaction -field-override stTransactionMarshaling -out gen_sttransaction.go
@@ -184,7 +186,7 @@ func (t *StateTest) RunNoVerify(subtest StateSubtest, vmconfig vm.Config, snapsh
 
 	var baseFee *big.Int
 	if config.IsEspresso(new(big.Int)) {
-		// baseFee = t.json.Env.BaseFee ?
+		baseFee = t.json.Env.BaseFee
 		if baseFee == nil {
 			// Retesteth uses `0x10` for genesis baseFee. Therefore, it defaults to
 			// parent - 2 : 0xa as the basefee for 'this' context.
@@ -344,7 +346,7 @@ func (tx *stTransaction) toMessage(ps stPostState, baseFee *big.Int) (core.Messa
 	}
 
 	msg := types.NewMessage(from, to, tx.Nonce, value, gasLimit, gasPrice,
-		tx.MaxFeePerGas, tx.MaxPriorityFeePerGas, nil, nil, nil, data, accessList, false, true)
+		tx.MaxFeePerGas, tx.MaxPriorityFeePerGas, nil, nil, nil, nil, data, accessList, false, false)
 	return msg, nil
 }
 
@@ -353,4 +355,8 @@ func rlpHash(x interface{}) (h common.Hash) {
 	rlp.Encode(hw, x)
 	hw.Sum(h[:0])
 	return h
+}
+
+func vmTestBlockHash(n uint64) common.Hash {
+	return common.BytesToHash(crypto.Keccak256([]byte(big.NewInt(int64(n)).String())))
 }

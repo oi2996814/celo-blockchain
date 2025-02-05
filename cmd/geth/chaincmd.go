@@ -93,11 +93,15 @@ The dumpgenesis command dumps the genesis block configuration in JSON format to 
 			utils.MetricsHTTPFlag,
 			utils.MetricsPortFlag,
 			utils.MetricsEnableInfluxDBFlag,
+			utils.MetricsEnableInfluxDBV2Flag,
 			utils.MetricsInfluxDBEndpointFlag,
 			utils.MetricsInfluxDBDatabaseFlag,
 			utils.MetricsInfluxDBUsernameFlag,
 			utils.MetricsInfluxDBPasswordFlag,
 			utils.MetricsInfluxDBTagsFlag,
+			utils.MetricsInfluxDBTokenFlag,
+			utils.MetricsInfluxDBBucketFlag,
+			utils.MetricsInfluxDBOrganizationFlag,
 			utils.TxLookupLimitFlag,
 		},
 		Category: "BLOCKCHAIN COMMANDS",
@@ -225,7 +229,7 @@ func dumpGenesis(ctx *cli.Context) error {
 	// TODO(rjl493456442) support loading from the custom datadir
 	genesis := utils.MakeGenesis(ctx)
 	if genesis == nil {
-		genesis = core.MainnetGenesisBlock()
+		genesis = core.DefaultGenesisBlock()
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(genesis); err != nil {
 		utils.Fatalf("could not encode genesis")

@@ -123,7 +123,7 @@ func dummyBlock(number int64) *types.Block {
 	}
 	feeCurrencyAddr := common.HexToAddress("02")
 	gatewayFeeRecipientAddr := common.HexToAddress("03")
-	tx := types.NewTransaction(1, common.HexToAddress("01"), big.NewInt(1), 10000, big.NewInt(10), &feeCurrencyAddr, &gatewayFeeRecipientAddr, big.NewInt(34), []byte{04})
+	tx := types.NewCeloTransaction(1, common.HexToAddress("01"), big.NewInt(1), 10000, big.NewInt(10), &feeCurrencyAddr, &gatewayFeeRecipientAddr, big.NewInt(34), []byte{04})
 	return types.NewBlock(header, []*types.Transaction{tx}, nil, nil, newHasher())
 }
 func dummyMessage(code uint64) *Message {
@@ -132,12 +132,6 @@ func dummyMessage(code uint64) *Message {
 	// existent slices.
 	msg.Signature = []byte{}
 	return msg
-}
-
-func dummyRoundChangeCertificate() *RoundChangeCertificate {
-	return &RoundChangeCertificate{
-		RoundChangeMessages: []Message{*dummyMessage(42), *dummyMessage(32), *dummyMessage(15)},
-	}
 }
 
 func dummyPreparedCertificate() *PreparedCertificate {
@@ -189,47 +183,6 @@ func TestMessageRLPEncoding(t *testing.T) {
 	}
 }
 
-func TestRoundChangeCertificateRLPEncoding(t *testing.T) {
-	var result, original *RoundChangeCertificate
-	original = dummyRoundChangeCertificate()
-
-	rawVal, err := rlp.EncodeToBytes(original)
-	if err != nil {
-		t.Fatalf("Error %v", err)
-	}
-
-	if err = rlp.DecodeBytes(rawVal, &result); err != nil {
-		t.Fatalf("Error %v", err)
-	}
-
-	if !reflect.DeepEqual(original, result) {
-		t.Fatalf("RLP Encode/Decode mismatch. Got %v, expected %v", result, original)
-	}
-}
-
-func TestPreprepareRLPEncoding(t *testing.T) {
-	var result, original *Preprepare
-	original = &Preprepare{
-		View:                   dummyView(),
-		RoundChangeCertificate: *dummyRoundChangeCertificate(),
-		Proposal:               dummyBlock(1),
-	}
-
-	rawVal, err := rlp.EncodeToBytes(original)
-	if err != nil {
-		t.Fatalf("Error %v", err)
-	}
-
-	if err = rlp.DecodeBytes(rawVal, &result); err != nil {
-		t.Fatalf("Error %v", err)
-	}
-
-	// decoded Blocks don't equal Original ones so we need to check equality differently
-	assertEqual(t, "RLP Encode/Decode mismatch: View", result.View, original.View)
-	assertEqual(t, "RLP Encode/Decode mismatch: RoundChangeCertificate", result.RoundChangeCertificate, original.RoundChangeCertificate)
-	assertEqual(t, "RLP Encode/Decode mismatch: BlockHash", result.Proposal.Hash(), original.Proposal.Hash())
-}
-
 func TestPreparedCertificateRLPEncoding(t *testing.T) {
 	var result, original *PreparedCertificate
 	original = dummyPreparedCertificate()
@@ -246,28 +199,6 @@ func TestPreparedCertificateRLPEncoding(t *testing.T) {
 	// decoded Blocks don't equal Original ones so we need to check equality differently
 	assertEqual(t, "RLP Encode/Decode mismatch: PrepareOrCommitMessages", result.PrepareOrCommitMessages, original.PrepareOrCommitMessages)
 	assertEqual(t, "RLP Encode/Decode mismatch: BlockHash", result.Proposal.Hash(), original.Proposal.Hash())
-}
-
-func TestRoundChangeRLPEncoding(t *testing.T) {
-	var result, original *RoundChange
-	original = &RoundChange{
-		View:                dummyView(),
-		PreparedCertificate: *dummyPreparedCertificate(),
-	}
-
-	rawVal, err := rlp.EncodeToBytes(original)
-	if err != nil {
-		t.Fatalf("Error %v", err)
-	}
-
-	if err = rlp.DecodeBytes(rawVal, &result); err != nil {
-		t.Fatalf("Error %v", err)
-	}
-
-	// decoded Blocks don't equal Original ones so we need to check equality differently
-	assertEqual(t, "RLP Encode/Decode mismatch: View", result.View, original.View)
-	assertEqual(t, "RLP Encode/Decode mismatch: PreparedCertificate.PrepareOrCommitMessages", result.PreparedCertificate.PrepareOrCommitMessages, original.PreparedCertificate.PrepareOrCommitMessages)
-	assertEqual(t, "RLP Encode/Decode mismatch: PreparedCertificate.BlockHash", result.PreparedCertificate.Proposal.Hash(), original.PreparedCertificate.Proposal.Hash())
 }
 
 func TestSubjectRLPEncoding(t *testing.T) {

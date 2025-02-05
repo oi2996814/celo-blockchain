@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
+//go:build none
 // +build none
 
 /*
@@ -23,21 +24,20 @@ Usage: go run build/ci.go <command> <command flags/arguments>
 
 Available commands are:
 
-   install     [ -arch architecture ] [ -cc compiler ] [ packages... ]                          -- builds packages and executables
-   test        [ -coverage ] [ packages... ]                                                    -- runs the tests
-   lint                                                                                         -- runs certain pre-selected linters
-   archive     [ -arch architecture ] [ -type zip|tar ] [ -signer key-envvar ] [ -upload dest ] -- archives build artifacts
-   importkeys                                                                                   -- imports signing keys from env
-   debsrc      [ -signer key-id ] [ -upload dest ]                                              -- creates a debian source package
-   nsis                                                                                         -- creates a Windows NSIS installer
-   aar         [ -local ] [ -sign key-id ] [-deploy repo] [ -upload dest ]                      -- creates an Android archive
-   xcode       [ -local ] [ -sign key-id ] [-deploy repo] [ -upload dest ]                      -- creates an iOS XCode framework
-   xgo         [ -alltools ] [ options ]                                                        -- cross builds according to options
-   xgo-archive [ -targets linux/amd64,linux/386... ][ -type zip|tar ][ -in dir ][ -out dir ]	-- archives build artifacts from cross-compilation
-   purge       [ -store blobstore ] [ -days threshold ]                                         -- purges old archives from the blobstore
+	install    [ -arch architecture ] [ -cc compiler ] [ packages... ]                          -- builds packages and executables
+	test       [ -coverage ] [ packages... ]                                                    -- runs the tests
+	lint                                                                                        -- runs certain pre-selected linters
+	archive    [ -arch architecture ] [ -type zip|tar ] [ -signer key-envvar ] [ -upload dest ] -- archives build artifacts
+	importkeys                                                                                  -- imports signing keys from env
+	debsrc     [ -signer key-id ] [ -upload dest ]                                              -- creates a debian source package
+	nsis                                                                                        -- creates a Windows NSIS installer
+	aar        [ -local ] [ -sign key-id ] [-deploy repo] [ -upload dest ]                      -- creates an Android archive
+	xcode      [ -local ] [ -sign key-id ] [-deploy repo] [ -upload dest ]                      -- creates an iOS XCode framework
+	xgo         [ -alltools ] [ options ]                                                       -- cross builds according to options
+	xgo-archive [ -targets linux/amd64,linux/386... ][ -type zip|tar ][ -in dir ][ -out dir ]	-- archives build artifacts from cross-compilation
+	purge      [ -store blobstore ] [ -days threshold ]                                         -- purges old archives from the blobstore
 
 For all commands, -n prevents execution of external programs (dry run mode).
-
 */
 package main
 
@@ -80,7 +80,6 @@ var (
 		executablePath("evm"),
 		executablePath("geth"),
 		executablePath("rlpdump"),
-		executablePath("clef"),
 		executablePath("blspopchecker"),
 	}
 
@@ -107,10 +106,6 @@ var (
 			Description: "Developer utility tool that prints RLP structures.",
 		},
 		{
-			BinaryName:  "clef",
-			Description: "Ethereum account management tool.",
-		},
-		{
 			BinaryName:  "blspopchecker",
 			Description: "Developer utility tool checks BLS PoP signatures in genesis.",
 		},
@@ -130,19 +125,13 @@ var (
 
 	// Distros for which packages are created.
 	// Note: vivid is unsupported because there is no golang-1.6 package for it.
-	// Note: wily is unsupported because it was officially deprecated on Launchpad.
-	// Note: yakkety is unsupported because it was officially deprecated on Launchpad.
-	// Note: zesty is unsupported because it was officially deprecated on Launchpad.
-	// Note: artful is unsupported because it was officially deprecated on Launchpad.
-	// Note: cosmic is unsupported because it was officially deprecated on Launchpad.
-	// Note: disco is unsupported because it was officially deprecated on Launchpad.
-	// Note: eoan is unsupported because it was officially deprecated on Launchpad.
+	// Note: the following Ubuntu releases have been officially deprecated on Launchpad:
+	//   wily, yakkety, zesty, artful, cosmic, disco, eoan, groovy
 	debDistroGoBoots = map[string]string{
 		"trusty":  "golang-1.11",
 		"xenial":  "golang-go",
 		"bionic":  "golang-go",
 		"focal":   "golang-go",
-		"groovy":  "golang-go",
 		"hirsute": "golang-go",
 	}
 
@@ -154,7 +143,7 @@ var (
 	// This is the version of go that will be downloaded by
 	//
 	//     go run ci.go install -dlgo
-	dlgoVersion = "1.16.4"
+	dlgoVersion = "1.19.1"
 )
 
 var GOBIN, _ = filepath.Abs(filepath.Join("build", "bin"))
@@ -355,12 +344,21 @@ func doLint(cmdline []string) {
 
 // downloadLinter downloads and unpacks golangci-lint.
 func downloadLinter(cachedir string) string {
-	const version = "1.39.0"
+	const version = "1.49.0"
 
 	csdb := build.MustLoadChecksums("build/checksums.txt")
-	base := fmt.Sprintf("golangci-lint-%s-%s-%s", version, runtime.GOOS, runtime.GOARCH)
-	url := fmt.Sprintf("https://github.com/golangci/golangci-lint/releases/download/v%s/%s.tar.gz", version, base)
-	archivePath := filepath.Join(cachedir, base+".tar.gz")
+	arch := runtime.GOARCH
+	ext := ".tar.gz"
+
+	if runtime.GOOS == "windows" {
+		ext = ".zip"
+	}
+	if arch == "arm" {
+		arch += "v" + os.Getenv("GOARM")
+	}
+	base := fmt.Sprintf("golangci-lint-%s-%s-%s", version, runtime.GOOS, arch)
+	url := fmt.Sprintf("https://github.com/golangci/golangci-lint/releases/download/v%s/%s%s", version, base, ext)
+	archivePath := filepath.Join(cachedir, base+ext)
 	if err := csdb.DownloadFile(url, archivePath); err != nil {
 		log.Fatal(err)
 	}
@@ -1348,8 +1346,6 @@ func xgoAllToolsArchiveFiles(target string, dir string) []string {
 		executableXgoPath("evm", target, dir),
 		executableXgoPath("geth", target, dir),
 		executableXgoPath("rlpdump", target, dir),
-		executableXgoPath("wnode", target, dir),
-		executableXgoPath("clef", target, dir),
 		executableXgoPath("blspopchecker", target, dir),
 	}
 }

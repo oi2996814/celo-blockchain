@@ -18,7 +18,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"sort"
@@ -31,18 +30,22 @@ import (
 	"github.com/celo-org/celo-blockchain/cmd/utils"
 	"github.com/celo-org/celo-blockchain/common"
 	"github.com/celo-org/celo-blockchain/console/prompt"
-	"github.com/celo-org/celo-blockchain/contracts/blockchain_parameters"
-	"github.com/celo-org/celo-blockchain/core/vm"
+	"github.com/celo-org/celo-blockchain/core/types"
 	"github.com/celo-org/celo-blockchain/eth"
 	"github.com/celo-org/celo-blockchain/eth/downloader"
 	"github.com/celo-org/celo-blockchain/ethclient"
 	"github.com/celo-org/celo-blockchain/internal/debug"
 	"github.com/celo-org/celo-blockchain/internal/ethapi"
 	"github.com/celo-org/celo-blockchain/internal/flags"
+	lesDownloader "github.com/celo-org/celo-blockchain/les/downloader"
 	"github.com/celo-org/celo-blockchain/log"
 	"github.com/celo-org/celo-blockchain/metrics"
 	"github.com/celo-org/celo-blockchain/node"
-	"github.com/celo-org/celo-blockchain/rpc"
+
+	// Force-load the tracer engines to trigger registration
+	_ "github.com/celo-org/celo-blockchain/eth/tracers/js"
+	_ "github.com/celo-org/celo-blockchain/eth/tracers/native"
+
 	"gopkg.in/urfave/cli.v1"
 )
 
@@ -70,7 +73,8 @@ var (
 		utils.NoUSBFlag,
 		utils.USBFlag,
 		// utils.SmartCardDaemonPathFlag,
-		utils.OverrideEHardforkFlag,
+		utils.OverrideHForkFlag,
+		utils.L2MigrationBlockFlag,
 		utils.TxPoolLocalsFlag,
 		utils.TxPoolNoLocalsFlag,
 		utils.TxPoolJournalFlag,
@@ -151,7 +155,6 @@ var (
 		utils.AnnounceAggressiveQueryEnodeGossipOnEnablementFlag,
 		utils.PingIPFromPacketFlag,
 		utils.UseInMemoryDiscoverTableFlag,
-		utils.VersionCheckFlag,
 		utils.ProxyFlag,
 		utils.ProxyInternalFacingEndpointFlag,
 		utils.ProxiedValidatorAddressFlag,
@@ -159,20 +162,17 @@ var (
 		utils.ProxyEnodeURLPairsFlag,
 		utils.LegacyProxyEnodeURLPairsFlag,
 		utils.ProxyAllowPrivateIPFlag,
+		utils.CeloFeeCurrencyDefault,
+		utils.CeloFeeCurrencyLimits,
 	}
 
 	rpcFlags = []cli.Flag{
+		utils.DisableRPCETHCompatibility,
 		utils.HTTPEnabledFlag,
 		utils.HTTPListenAddrFlag,
 		utils.HTTPPortFlag,
 		utils.HTTPCORSDomainFlag,
 		utils.HTTPVirtualHostsFlag,
-		utils.LegacyRPCEnabledFlag,
-		utils.LegacyRPCListenAddrFlag,
-		utils.LegacyRPCPortFlag,
-		utils.LegacyRPCCORSDomainFlag,
-		utils.LegacyRPCVirtualHostsFlag,
-		utils.LegacyRPCApiFlag,
 		utils.GraphQLEnabledFlag,
 		utils.GraphQLCORSDomainFlag,
 		utils.GraphQLVirtualHostsFlag,
@@ -195,6 +195,7 @@ var (
 		utils.IPCPathFlag,
 		utils.InsecureUnlockAllowedFlag,
 		utils.RPCGlobalGasInflationRateFlag,
+		utils.RPCGlobalGasPriceMultiplierFlag,
 		utils.RPCGlobalGasCapFlag,
 		utils.RPCGlobalTxFeeCapFlag,
 	}
@@ -210,6 +211,10 @@ var (
 		utils.MetricsInfluxDBUsernameFlag,
 		utils.MetricsInfluxDBPasswordFlag,
 		utils.MetricsInfluxDBTagsFlag,
+		utils.MetricsEnableInfluxDBV2Flag,
+		utils.MetricsInfluxDBTokenFlag,
+		utils.MetricsInfluxDBBucketFlag,
+		utils.MetricsInfluxDBOrganizationFlag,
 		utils.MetricsLoadTestCSVFlag,
 	}
 )
@@ -389,19 +394,26 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend) {
 	// close the node when synchronization is complete if user required.
 	if ctx.GlobalBool(utils.ExitWhenSyncedFlag.Name) {
 		go func() {
-			sub := stack.EventMux().Subscribe(downloader.DoneEvent{})
+			// Subscribing to both events since les has its own downloader
+			sub := stack.EventMux().Subscribe(downloader.DoneEvent{}, lesDownloader.DoneEvent{})
 			defer sub.Unsubscribe()
 			for {
 				event := <-sub.Chan()
 				if event == nil {
 					continue
 				}
-				done, ok := event.Data.(downloader.DoneEvent)
-				if !ok {
+				var latest *types.Header
+				if done, ok := event.Data.(downloader.DoneEvent); ok {
+					latest = done.Latest
+				}
+				if lesDone, ok := event.Data.(lesDownloader.DoneEvent); ok {
+					latest = lesDone.Latest
+				}
+				if latest == nil {
 					continue
 				}
-				if timestamp := time.Unix(int64(done.Latest.Time), 0); time.Since(timestamp) < 10*time.Minute {
-					log.Info("Synchronisation completed", "latestnum", done.Latest.Number, "latesthash", done.Latest.Hash(),
+				if timestamp := time.Unix(int64(latest.Time), 0); time.Since(timestamp) < 10*time.Minute {
+					log.Info("Synchronisation completed", "latestnum", latest.Number, "latesthash", latest.Hash(),
 						"age", common.PrettyAge(timestamp))
 					stack.Close()
 				}
@@ -445,18 +457,6 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend) {
 		if err := ethBackend.StartMining(); err != nil {
 			utils.Fatalf("Failed to start mining: %v", err)
 		}
-	}
-	if !ctx.GlobalBool(utils.VersionCheckFlag.Name) {
-		runnerFactory := func() (vm.EVMRunner, error) {
-			header := backend.CurrentHeader()
-			stateDB, _, err := backend.StateAndHeaderByNumberOrHash(context.Background(), rpc.BlockNumberOrHashWithHash(header.Hash(), true))
-			if err != nil {
-				return nil, err
-			}
-			return backend.NewEVMRunner(header, stateDB), nil
-		}
-
-		blockchain_parameters.SpawnCheck(runnerFactory)
 	}
 }
 

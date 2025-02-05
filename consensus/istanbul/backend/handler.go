@@ -36,7 +36,6 @@ var (
 	errDecodeFailed = errors.New("fail to decode istanbul message")
 )
 
-// If you want to add a code, you need to increment the Lengths Array size!
 const (
 	handshakeTimeout = 5 * time.Second
 )
@@ -239,7 +238,7 @@ func (sb *Backend) UpdateMetricsForParentOfBlock(child *types.Block) {
 
 	// Now check if this validator signer is in the "parent seal" on the child block.
 	// The parent seal is used for downtime calculations.
-	childExtra, err := types.ExtractIstanbulExtra(child.Header())
+	childExtra, err := child.Header().IstanbulExtra()
 	if err != nil {
 		return
 	}
@@ -427,7 +426,7 @@ func (sb *Backend) Handshake(peer consensus.Peer) (bool, error) {
 		}
 		// No need to use sb.AsyncSendCeloMsg, since this is already
 		// being called within a goroutine.
-		err = peer.Send(istanbul.ValidatorHandshakeMsg, msgBytes)
+		err = peer.EncodeAndSend(istanbul.ValidatorHandshakeMsg, msgBytes)
 		if err != nil {
 			errCh <- err
 			return

@@ -22,14 +22,15 @@ import (
 	"math/big"
 
 	"github.com/celo-org/celo-blockchain/common"
-	"github.com/celo-org/celo-blockchain/common/hexutil"
 	"github.com/celo-org/celo-blockchain/contracts"
 	"github.com/celo-org/celo-blockchain/contracts/blockchain_parameters"
+	"github.com/celo-org/celo-blockchain/contracts/config"
 	"github.com/celo-org/celo-blockchain/contracts/currency"
-	gpm "github.com/celo-org/celo-blockchain/contracts/gasprice_minimum"
+	"github.com/celo-org/celo-blockchain/contracts/erc20gas"
 	"github.com/celo-org/celo-blockchain/core/types"
 	"github.com/celo-org/celo-blockchain/core/vm"
 	"github.com/celo-org/celo-blockchain/core/vm/vmcontext"
+	gpm "github.com/celo-org/celo-blockchain/eth/gasprice"
 	"github.com/celo-org/celo-blockchain/log"
 	"github.com/celo-org/celo-blockchain/params"
 	// cmath "github.com/celo-org/celo-blockchain/common/math"
@@ -38,23 +39,26 @@ import (
 // Used for EOA  Check
 // var emptyCodeHash = crypto.Keccak256Hash(nil)
 
-/*
-The State Transitioning Model
-
-A state transition is a change made when a transaction is applied to the current world state
-The state transitioning model does all the necessary work to work out a valid new state root.
-
-1) Nonce handling
-2) Pre pay gas
-3) Create a new state object if the recipient is \0*32
-4) Value transfer
-== If contract creation ==
-  4a) Attempt to run transaction data
-  4b) If valid, use result as code for the new state object
-== end ==
-5) Run Script section
-6) Derive new state root
-*/
+// The State Transitioning Model
+//
+// A state transition is a change made when a transaction is applied to the current world
+// state. The state transitioning model does all the necessary work to work out a valid new
+// state root.
+//
+//  1. Nonce handling
+//  2. Pre pay gas
+//  3. Create a new state object if the recipient is \0*32
+//  4. Value transfer
+//
+// == If contract creation ==
+//
+//	4a. Attempt to run transaction data
+//	4b. If valid, use result as code for the new state object
+//
+// == end ==
+//
+//  5. Run Script section
+//  6. Derive new state root
 type StateTransition struct {
 	gp              *GasPool
 	msg             Message
@@ -70,6 +74,7 @@ type StateTransition struct {
 	vmRunner        vm.EVMRunner
 	gasPriceMinimum *big.Int
 	sysCtx          *SysContractCallCtx
+	erc20FeeDebited *big.Int
 }
 
 // Message represents a message sent to a contract.
@@ -82,16 +87,19 @@ type Message interface {
 	GasTipCap() *big.Int
 	Gas() uint64
 
-	// FeeCurrency specifies the currency for gas and gateway fees.
+	// FeeCurrency specifies the currency from which to pay for the fees
 	// nil correspond to Celo Gold (native currency).
 	// All other values should correspond to ERC20 contract addresses extended to be compatible with gas payments.
 	FeeCurrency() *common.Address
+	// MaxFeeInFeeCurrency Set iff it's a celo denominated tx. Maximum value of fees when converted to FeeCurrency.
+	MaxFeeInFeeCurrency() *big.Int
 	GatewayFeeRecipient() *common.Address
 	GatewayFee() *big.Int
+	GatewaySet() bool
 	Value() *big.Int
 
 	Nonce() uint64
-	CheckNonce() bool
+	IsFake() bool
 	Data() []byte
 	AccessList() types.AccessList
 
@@ -100,7 +108,7 @@ type Message interface {
 }
 
 func CheckEthCompatibility(msg Message) error {
-	if msg.EthCompatible() && !(msg.FeeCurrency() == nil && msg.GatewayFeeRecipient() == nil && msg.GatewayFee().Sign() == 0) {
+	if msg.EthCompatible() && (msg.FeeCurrency() != nil || msg.GatewaySet()) {
 		return types.ErrEthCompatibleTransactionIsntCompatible
 	}
 	return nil
@@ -209,9 +217,14 @@ func IntrinsicGas(data []byte, accessList types.AccessList, isContractCreation b
 func NewStateTransition(evm *vm.EVM, msg Message, gp *GasPool, vmRunner vm.EVMRunner, sysCtx *SysContractCallCtx) *StateTransition {
 	var gasPriceMinimum *big.Int
 	if evm.ChainConfig().IsEspresso(evm.Context.BlockNumber) {
-		gasPriceMinimum = sysCtx.GetGasPriceMinimum(msg.FeeCurrency())
+		if msg.MaxFeeInFeeCurrency() != nil {
+			// Celo denominated tx
+			gasPriceMinimum = sysCtx.GetGasPriceMinimum(nil)
+		} else {
+			gasPriceMinimum = sysCtx.GetGasPriceMinimum(msg.FeeCurrency())
+		}
 	} else {
-		gasPriceMinimum, _ = gpm.GetGasPriceMinimum(vmRunner, msg.FeeCurrency())
+		gasPriceMinimum, _ = gpm.GetBaseFeeForCurrency(vmRunner, msg.FeeCurrency(), nil)
 	}
 
 	return &StateTransition{
@@ -242,17 +255,6 @@ func ApplyMessage(evm *vm.EVM, msg Message, gp *GasPool, vmRunner vm.EVMRunner, 
 	return NewStateTransition(evm, msg, gp, vmRunner, sysCtx).TransitionDb()
 }
 
-// ApplyMessageWithoutGasPriceMinimum applies the given message with the gas price minimum
-// set to zero. It's only for use in eth_call and eth_estimateGas, so that they can be used
-// with gas price set to zero if the sender doesn't have funds to pay for gas.
-// Returns the gas used (which does not include gas refunds) and an error if it failed.
-func ApplyMessageWithoutGasPriceMinimum(evm *vm.EVM, msg Message, gp *GasPool, vmRunner vm.EVMRunner, sysCtx *SysContractCallCtx) (*ExecutionResult, error) {
-	log.Trace("Applying state transition message without gas price minimum", "from", msg.From(), "nonce", msg.Nonce(), "to", msg.To(), "fee currency", msg.FeeCurrency(), "gateway fee recipient", msg.GatewayFeeRecipient(), "gateway fee", msg.GatewayFee(), "gas limit", msg.Gas(), "value", msg.Value(), "data", msg.Data())
-	st := NewStateTransition(evm, msg, gp, vmRunner, sysCtx)
-	st.gasPriceMinimum = common.Big0
-	return st.TransitionDb()
-}
-
 // to returns the recipient of the message.
 func (st *StateTransition) to() common.Address {
 	if st.msg == nil || st.msg.To() == nil /* contract creation */ {
@@ -262,7 +264,7 @@ func (st *StateTransition) to() common.Address {
 }
 
 // payFees deducts gas and gateway fees from sender balance and adds the purchased amount of gas to the state.
-func (st *StateTransition) payFees(espresso bool) error {
+func (st *StateTransition) payFees(espresso bool, denominatedCurrencyRate *currency.ExchangeRate) error {
 	var isWhiteListed bool
 	if espresso {
 		isWhiteListed = st.sysCtx.IsWhitelisted(st.msg.FeeCurrency())
@@ -273,8 +275,7 @@ func (st *StateTransition) payFees(espresso bool) error {
 		log.Trace("Fee currency not whitelisted", "fee currency address", st.msg.FeeCurrency())
 		return ErrNonWhitelistedFeeCurrency
 	}
-
-	if err := st.canPayFee(st.msg.From(), st.msg.FeeCurrency(), espresso); err != nil {
+	if err := st.canPayFee(st.msg.From(), st.msg.FeeCurrency(), espresso, denominatedCurrencyRate); err != nil {
 		return err
 	}
 	if err := st.gp.SubGas(st.msg.Gas()); err != nil {
@@ -283,7 +284,7 @@ func (st *StateTransition) payFees(espresso bool) error {
 
 	st.initialGas = st.msg.Gas()
 	st.gas += st.msg.Gas()
-	err := st.debitFee(st.msg.From(), st.msg.FeeCurrency())
+	err := st.debitFee(st.msg.From(), st.msg.FeeCurrency(), denominatedCurrencyRate)
 	return err
 }
 
@@ -292,10 +293,11 @@ func (st *StateTransition) payFees(espresso bool) error {
 // For native token(CELO) as feeCurrency:
 //   - Pre-Espresso: it ensures balance >= GasPrice * gas + gatewayFee (1)
 //   - Post-Espresso: it ensures balance >= GasFeeCap * gas + value + gatewayFee (2)
+//
 // For non-native tokens(cUSD, cEUR, ...) as feeCurrency:
 //   - Pre-Espresso: it ensures balance > GasPrice * gas + gatewayFee (3)
 //   - Post-Espresso: it ensures balance >= GasFeeCap * gas + gatewayFee (4)
-func (st *StateTransition) canPayFee(accountOwner common.Address, feeCurrency *common.Address, espresso bool) error {
+func (st *StateTransition) canPayFee(accountOwner common.Address, feeCurrency *common.Address, espresso bool, denominatedCurrencyRate *currency.ExchangeRate) error {
 	if feeCurrency == nil {
 		balance := st.state.GetBalance(st.msg.From())
 		if espresso {
@@ -328,11 +330,21 @@ func (st *StateTransition) canPayFee(accountOwner common.Address, feeCurrency *c
 			return err
 		}
 		if espresso {
+			var feeGap *big.Int
 			// feeGap = GasFeeCap * gas + gatewayFee, as in (4)
-			feeGap := new(big.Int).SetUint64(st.msg.Gas())
+			feeGap = new(big.Int).SetUint64(st.msg.Gas())
 			feeGap.Mul(feeGap, st.gasFeeCap)
 			if st.msg.GatewayFeeRecipient() != nil {
 				feeGap.Add(feeGap, st.msg.GatewayFee())
+			}
+			if st.msg.MaxFeeInFeeCurrency() != nil {
+				// Celo Denominated Tx: max fee is a tx field
+				// Translate fees to feeCurrency
+				feeGap = denominatedCurrencyRate.FromBase(feeGap)
+				// Check that fee <= MaxFeeInFeeCurrency
+				if feeGap.Cmp(st.msg.MaxFeeInFeeCurrency()) > 0 {
+					return ErrDenominatedLowMaxFee
+				}
 			}
 			if balance.Cmp(feeGap) < 0 {
 				return fmt.Errorf("%w: address %v have %v want %v", ErrInsufficientFunds, st.msg.From().Hex(), balance, feeGap)
@@ -351,63 +363,10 @@ func (st *StateTransition) canPayFee(accountOwner common.Address, feeCurrency *c
 	return nil
 }
 
-func (st *StateTransition) debitGas(address common.Address, amount *big.Int, feeCurrency *common.Address) error {
-	if amount.Cmp(big.NewInt(0)) == 0 {
+func (st *StateTransition) debitFee(from common.Address, feeCurrency *common.Address, denominatedCurrencyRate *currency.ExchangeRate) (err error) {
+	if st.evm.Config.SkipDebitCredit {
 		return nil
 	}
-	evm := st.evm
-	// Function is "debitGasFees(address from, uint256 value)"
-	// selector is first 4 bytes of keccak256 of "debitGasFees(address,uint256)"
-	// Source:
-	// pip3 install pyethereum
-	// python3 -c 'from ethereum.utils import sha3; print(sha3("debitGasFees(address,uint256)")[0:4].hex())'
-	functionSelector := hexutil.MustDecode("0x58cf9672")
-	transactionData := common.GetEncodedAbi(functionSelector, [][]byte{common.AddressToAbi(address), common.AmountToAbi(amount)})
-
-	// Run only primary evm.Call() with tracer
-	if evm.GetDebug() {
-		evm.SetDebug(false)
-		defer func() { evm.SetDebug(true) }()
-	}
-
-	rootCaller := vm.AccountRef(common.HexToAddress("0x0"))
-	// The caller was already charged for the cost of this operation via IntrinsicGas.
-	_, leftoverGas, err := evm.Call(rootCaller, *feeCurrency, transactionData, params.MaxGasForDebitGasFeesTransactions, big.NewInt(0))
-	gasUsed := params.MaxGasForDebitGasFeesTransactions - leftoverGas
-	log.Trace("debitGasFees called", "feeCurrency", *feeCurrency, "gasUsed", gasUsed)
-	return err
-}
-
-func (st *StateTransition) creditGasFees(
-	from common.Address,
-	feeRecipient common.Address,
-	gatewayFeeRecipient *common.Address,
-	communityFund common.Address,
-	refund *big.Int,
-	tipTxFee *big.Int,
-	gatewayFee *big.Int,
-	baseTxFee *big.Int,
-	feeCurrency *common.Address) error {
-	evm := st.evm
-	// Function is "creditGasFees(address,address,address,address,uint256,uint256,uint256,uint256)"
-	functionSelector := hexutil.MustDecode("0x6a30b253")
-	transactionData := common.GetEncodedAbi(functionSelector, [][]byte{common.AddressToAbi(from), common.AddressToAbi(feeRecipient), common.AddressToAbi(*gatewayFeeRecipient), common.AddressToAbi(communityFund), common.AmountToAbi(refund), common.AmountToAbi(tipTxFee), common.AmountToAbi(gatewayFee), common.AmountToAbi(baseTxFee)})
-
-	// Run only primary evm.Call() with tracer
-	if evm.GetDebug() {
-		evm.SetDebug(false)
-		defer func() { evm.SetDebug(true) }()
-	}
-
-	rootCaller := vm.AccountRef(common.HexToAddress("0x0"))
-	// The caller was already charged for the cost of this operation via IntrinsicGas.
-	_, leftoverGas, err := evm.Call(rootCaller, *feeCurrency, transactionData, params.MaxGasForCreditGasFeesTransactions, big.NewInt(0))
-	gasUsed := params.MaxGasForCreditGasFeesTransactions - leftoverGas
-	log.Trace("creditGas called", "feeCurrency", *feeCurrency, "gasUsed", gasUsed)
-	return err
-}
-
-func (st *StateTransition) debitFee(from common.Address, feeCurrency *common.Address) (err error) {
 	effectiveFee := new(big.Int).Mul(new(big.Int).SetUint64(st.msg.Gas()), st.gasPrice)
 	// If GatewayFeeRecipient is unspecified, the gateway fee value is ignore and the sender is not charged.
 	if st.msg.GatewayFeeRecipient() != nil {
@@ -419,13 +378,19 @@ func (st *StateTransition) debitFee(from common.Address, feeCurrency *common.Add
 		st.state.SubBalance(from, effectiveFee)
 		return nil
 	} else {
-		return st.debitGas(from, effectiveFee, feeCurrency)
+		if st.msg.MaxFeeInFeeCurrency() != nil {
+			st.erc20FeeDebited = denominatedCurrencyRate.FromBase(effectiveFee)
+		} else {
+			st.erc20FeeDebited = effectiveFee
+		}
+		return erc20gas.DebitFees(st.evm, from, st.erc20FeeDebited, feeCurrency)
 	}
 }
 
 func (st *StateTransition) preCheck() error {
-	// Make sure this transaction's nonce is correct.
-	if st.msg.CheckNonce() {
+	// Only check transactions that are not fake
+	if !st.msg.IsFake() {
+		// Make sure this transaction's nonce is correct.
 		stNonce := st.state.GetNonce(st.msg.From())
 		if msgNonce := st.msg.Nonce(); stNonce < msgNonce {
 			return fmt.Errorf("%w: address %v, tx: %d state: %d", ErrNonceTooHigh,
@@ -435,9 +400,8 @@ func (st *StateTransition) preCheck() error {
 				st.msg.From().Hex(), msgNonce, stNonce)
 		}
 	}
-
-	// Make sure that transaction gasFeeCap >= baseFee (post Espresso)
-	if st.evm.ChainConfig().IsEspresso(st.evm.Context.BlockNumber) {
+	// Make sure that transaction gasFeeCap is greater than the baseFee (post london)
+	if st.evm.ChainConfig().IsLondon(st.evm.Context.BlockNumber) {
 		// Skip the checks if gas fields are zero and baseFee was explicitly disabled (eth_call)
 		if !st.evm.Config.NoBaseFee || st.gasFeeCap.BitLen() > 0 || st.gasTipCap.BitLen() > 0 {
 			if l := st.gasFeeCap.BitLen(); l > 256 {
@@ -458,7 +422,7 @@ func (st *StateTransition) preCheck() error {
 			}
 		}
 	} else { // Make sure this transaction's gas price >= baseFee (pre Espresso)
-		if st.gasPrice.Cmp(st.gasPriceMinimum) < 0 {
+		if !st.evm.Config.NoBaseFee && st.gasPrice.Cmp(st.gasPriceMinimum) < 0 {
 			log.Debug("Tx gas price is less than minimum", "minimum", st.gasPriceMinimum, "price", st.gasPrice)
 			return ErrGasPriceDoesNotExceedMinimum
 		}
@@ -477,13 +441,10 @@ func (st *StateTransition) preCheck() error {
 // TransitionDb will transition the state by applying the current message and
 // returning the evm execution result with following fields.
 //
-// - used gas:
-//      total gas used (including gas being refunded)
-// - returndata:
-//      the returned data from evm
-// - concrete execution error:
-//      various **EVM** error which aborts the execution,
-//      e.g. ErrOutOfGas, ErrExecutionReverted
+//   - used gas: total gas used (including gas being refunded)
+//   - returndata: the returned data from evm
+//   - concrete execution error: various EVM errors which abort the execution, e.g.
+//     ErrOutOfGas, ErrExecutionReverted
 //
 // However if any consensus issue encountered, return the error directly with
 // nil evm execution result.
@@ -507,6 +468,24 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	}
 	if err := CheckEthCompatibility(st.msg); err != nil {
 		return nil, err
+	}
+	if st.evm.ChainConfig().IsGingerbread(st.evm.Context.BlockNumber) && st.msg.GatewaySet() {
+		return nil, ErrGatewayFeeDeprecated
+	}
+	if !st.evm.ChainConfig().IsHFork(st.evm.Context.BlockNumber) && st.msg.MaxFeeInFeeCurrency() != nil {
+		return nil, ErrTxTypeNotSupported
+	}
+	if st.msg.FeeCurrency() == nil && st.msg.MaxFeeInFeeCurrency() != nil {
+		return nil, ErrDenominatedNoCurrency
+	}
+	var denominatedCurrencyRate *currency.ExchangeRate
+	// Get rate only for CELO denominated txs (H fork)
+	if st.msg.MaxFeeInFeeCurrency() != nil {
+		var err error
+		denominatedCurrencyRate, err = currency.GetExchangeRate(st.vmRunner, st.msg.FeeCurrency())
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Check clauses 1-2
@@ -539,7 +518,7 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 		return nil, fmt.Errorf("%w: have %d, want %d", ErrIntrinsicGas, st.msg.Gas(), gas)
 	}
 	// Check clauses 3-4, pay the fees (which buys gas), and subtract the intrinsic gas
-	err = st.payFees(espresso)
+	err = st.payFees(espresso, denominatedCurrencyRate)
 	if err != nil {
 		log.Error("Transaction failed to buy gas", "err", err, "gas", gas)
 		return nil, err
@@ -552,7 +531,7 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	}
 
 	// Set up the initial access list.
-	if rules := st.evm.ChainConfig().Rules(st.evm.Context.BlockNumber); espresso {
+	if rules := st.evm.ChainConfig().Rules(st.evm.Context.BlockNumber); rules.IsBerlin {
 		st.state.PrepareAccessList(msg.From(), msg.To(), vm.ActivePrecompiles(rules), msg.AccessList())
 	}
 	var (
@@ -575,7 +554,7 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 		st.refundGas(params.RefundQuotientEIP3529)
 	}
 
-	err = st.distributeTxFees()
+	err = st.creditTxFees(denominatedCurrencyRate)
 	if err != nil {
 		return nil, err
 	}
@@ -586,8 +565,12 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	}, nil
 }
 
-// distributeTxFees calculates the amounts and recipients of transaction fees and credits the accounts.
-func (st *StateTransition) distributeTxFees() error {
+// creditTxFees calculates the amounts and recipients of transaction fees and credits the accounts.
+func (st *StateTransition) creditTxFees(denominatedCurrencyRate *currency.ExchangeRate) error {
+	if st.evm.Config.SkipDebitCredit {
+		return nil
+	}
+
 	// Run only primary evm.Call() with tracer
 	if st.evm.GetDebug() {
 		st.evm.SetDebug(false)
@@ -605,6 +588,23 @@ func (st *StateTransition) distributeTxFees() error {
 	// No need to do effectiveTip calculation, because st.gasPrice == effectiveGasPrice, and effectiveTip = effectiveGasPrice - baseTxFee
 	tipTxFee := new(big.Int).Sub(totalTxFee, baseTxFee)
 
+	if st.msg.MaxFeeInFeeCurrency() != nil {
+		// Celo Denominated
+
+		// We want to ensure that
+		// 		st.erc20FeeDebited = tipTxFee + baseTxFee + refund
+		// so that debit and credit totals match. Since the exchange rate
+		// conversions have limited accuracy, the only way to achieve this
+		// is to calculate one of the three credit values based on the two
+		// others after the exchange rate conversion.
+		tipTxFee = denominatedCurrencyRate.FromBase(tipTxFee)
+		baseTxFee = denominatedCurrencyRate.FromBase(baseTxFee)
+		totalTxFee.Add(tipTxFee, baseTxFee)
+		refund.Sub(st.erc20FeeDebited, totalTxFee) // refund = debited - tip - basefee
+		// No need to exchange gateway fee since it's it's deprecated on G fork,
+		// and MaxFeeInFeeCurrency can only be present in H fork (which implies G fork)
+	}
+
 	feeCurrency := st.msg.FeeCurrency()
 
 	gatewayFeeRecipient := st.msg.GatewayFeeRecipient()
@@ -613,33 +613,39 @@ func (st *StateTransition) distributeTxFees() error {
 	}
 
 	caller := &vmcontext.SharedEVMRunner{EVM: st.evm}
-	governanceAddress, err := contracts.GetRegisteredAddress(caller, params.GovernanceRegistryId)
+	var contractId [32]byte
+	if st.evm.ChainConfig().IsGingerbread(st.evm.Context.BlockNumber) {
+		contractId = config.FeeHandlerId
+	} else {
+		contractId = config.GovernanceRegistryId
+	}
+	feeHandlerAddress, err := contracts.GetRegisteredAddress(caller, contractId)
 	if err != nil {
 		if err != contracts.ErrSmartContractNotDeployed && err != contracts.ErrRegistryContractNotDeployed {
 			return err
 		}
-		log.Trace("Cannot credit gas fee to community fund: refunding fee to sender", "error", err, "fee", baseTxFee)
-		governanceAddress = common.ZeroAddress
+		log.Trace("Cannot credit gas fee to FeeHandler: refunding fee to sender", "error", err, "fee", baseTxFee)
+		feeHandlerAddress = common.ZeroAddress
 		refund.Add(refund, baseTxFee)
 		baseTxFee = new(big.Int)
 	}
 
-	log.Trace("distributeTxFees", "from", from, "refund", refund, "feeCurrency", st.msg.FeeCurrency(),
+	log.Trace("creditTxFees", "from", from, "refund", refund, "feeCurrency", st.msg.FeeCurrency(),
 		"gatewayFeeRecipient", *gatewayFeeRecipient, "gatewayFee", st.msg.GatewayFee(),
 		"coinbaseFeeRecipient", st.evm.Context.Coinbase, "coinbaseFee", tipTxFee,
-		"comunityFundRecipient", governanceAddress, "communityFundFee", baseTxFee)
+		"feeHandler", feeHandlerAddress, "communityFundFee", baseTxFee)
 	if feeCurrency == nil {
 		if gatewayFeeRecipient != &common.ZeroAddress {
 			st.state.AddBalance(*gatewayFeeRecipient, st.msg.GatewayFee())
 		}
-		if governanceAddress != common.ZeroAddress {
-			st.state.AddBalance(governanceAddress, baseTxFee)
+		if feeHandlerAddress != common.ZeroAddress {
+			st.state.AddBalance(feeHandlerAddress, baseTxFee)
 		}
 		st.state.AddBalance(st.evm.Context.Coinbase, tipTxFee)
 		st.state.AddBalance(from, refund)
 	} else {
-		if err = st.creditGasFees(from, st.evm.Context.Coinbase, gatewayFeeRecipient, governanceAddress, refund, tipTxFee, st.msg.GatewayFee(), baseTxFee, feeCurrency); err != nil {
-			log.Error("Error crediting", "from", from, "coinbase", st.evm.Context.Coinbase, "gateway", gatewayFeeRecipient, "fund", governanceAddress)
+		if err = erc20gas.CreditFees(st.evm, from, st.evm.Context.Coinbase, gatewayFeeRecipient, feeHandlerAddress, refund, tipTxFee, st.msg.GatewayFee(), baseTxFee, feeCurrency); err != nil {
+			log.Error("Error crediting", "from", from, "coinbase", st.evm.Context.Coinbase, "gateway", gatewayFeeRecipient, "feeHandler", feeHandlerAddress)
 			return err
 		}
 
